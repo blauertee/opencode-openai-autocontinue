@@ -1,0 +1,29 @@
+{
+  "name": "opencode-openai-autocontinue",
+  "version": "0.1.0",
+  "description": "OpenCode 2 plugin: when a ChatGPT/Codex subscription usage limit stops a session, wait for the reset and continue it",
+  "type": "module",
+  "license": "GPL-3.0-only",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/blauertee/opencode-openai-autocontinue.git"
+  },
+  "keywords": ["opencode", "opencode-plugin", "openai", "chatgpt", "codex", "rate-limit"],
+  "exports": {
+    ".": "./src/server.js",
+    "./server": "./src/server.js"
+  },
+  "files": ["src", "LICENSE", "README.md"],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test 'test/**/*.test.js'"
+  },
+  "peerDependencies": {
+    "@opencode/plugin": "^2.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@opencode/plugin": { "optional": true }
+  }
+}

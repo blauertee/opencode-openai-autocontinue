@@ -297,6 +297,37 @@ test("entries of other projects are left alone", async () => {
 })
 const TICK = 15_000
 
+test("hold: continues early when the limit clears before the reset (usage reset)", async () => {
+  const resetAt = START + 3 * 3_600_000
+  let reset = false
+  const h = await harness({ usage: () => (reset ? freeUsage : blockedUsage(resetAt)) })
+  const hold = await startHold(h)
+  for (let i = 0; i < 20; i++) await h.advance(15_000) // 5 minutes
+  assert.equal(hold.released(), false)
+  reset = true
+  for (let i = 0; i < 21; i++) await h.advance(15_000)
+  await hold.run
+  assert.equal(hold.released(), true)
+  assert.ok(h.now() < START + 11 * 60_000)
+  assert.equal(h.parts.size, 0)
+  assert.ok(h.logs.some((line) => line.includes("cleared before the reset time")))
+})
+
+test("fallback: resumes early when the limit clears before the reset", async () => {
+  const resetAt = START + 3 * 3_600_000
+  let reset = false
+  const h = await harness({ usage: () => (reset ? freeUsage : blockedUsage(resetAt)) })
+  await h.emit("message.updated", { info: assistant() })
+  await h.emit("session.error", { sessionID: "ses_1", error: usageError(S(resetAt)) })
+  await h.advance(5 * 60_000)
+  assert.equal(h.calls.prompt.length, 0)
+  reset = true
+  await h.advance(5 * 60_000)
+  await h.advance(15_000)
+  assert.equal(h.calls.prompt.length, 1)
+  assert.equal(h.state().ses_1, undefined)
+})
+
 test("an expired token is not used for the usage lookup", () => {
   assert.equal(bearerFromAuth({ type: "oauth", access: "a", expires: START - 1 }, START), null)
   assert.deepEqual(bearerFromAuth({ type: "oauth", access: "a", expires: START + 3_600_000, accountId: "x" }, START), { access: "a", accountID: "x" })

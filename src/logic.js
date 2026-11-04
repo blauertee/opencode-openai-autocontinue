@@ -9,6 +9,7 @@ export const DEFAULTS = Object.freeze({
   inlineMaxWaitMinutes: 60,
   maxWaitHours: 8 * 24,
   maxConsecutiveResumes: 8,
+  usageCheckMinutes: 5,
   resumeSubagents: false,
   usageURL: "https://chatgpt.com/backend-api/wham/usage",
   usageIntegrationID: "openai",
@@ -45,6 +46,7 @@ export function normalizeConfig(options = {}) {
     inlineMaxWaitMinutes: positive(input.inlineMaxWaitMinutes, DEFAULTS.inlineMaxWaitMinutes),
     maxWaitHours: positive(input.maxWaitHours, DEFAULTS.maxWaitHours) || DEFAULTS.maxWaitHours,
     maxConsecutiveResumes: Math.floor(positive(input.maxConsecutiveResumes, DEFAULTS.maxConsecutiveResumes)),
+    usageCheckMinutes: positive(input.usageCheckMinutes, DEFAULTS.usageCheckMinutes),
     resumeSubagents: input.resumeSubagents === true,
     usageURL: typeof input.usageURL === "string" && input.usageURL ? input.usageURL : DEFAULTS.usageURL,
     usageIntegrationID:
@@ -219,6 +221,14 @@ export function resetFromLimits(limits, nowMs = Date.now()) {
   if (main !== null) return main * 1000
   const extra = limits.additional.map((limit) => blockingReset(limit, nowSec)).filter((value) => value !== null)
   return extra.length ? Math.min(...extra) * 1000 : null
+}
+
+/**
+ * Whether usage data was read and shows nothing blocking, for example after
+ * the user redeemed a usage reset. Unreadable usage (null) is not "cleared".
+ */
+export function usageCleared(limits, nowMs = Date.now()) {
+  return Boolean(limits) && resetFromLimits(limits, nowMs) === null
 }
 
 /** Whether the usage data says the account is still blocked. */

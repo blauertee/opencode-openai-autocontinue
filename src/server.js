@@ -29,6 +29,7 @@ import {
   planResume,
   resetFromError,
   resetFromLimits,
+  usageCleared,
 } from "./logic.js"
 import { createLog, defaultLogFile } from "./log.js"
 import { createUsageReader } from "./usage.js"
@@ -226,8 +227,51 @@ export function createAutoContinuePlugin({
         }
       }
 
+      /* -- Early resume: the limit cleared before its reset time ------------ */
+
+      /** Sessions this plugin interrupted to resume early. */
+      const stoppedEarly = new Set()
+      /** sessionID -> when the usage was last checked for an early resume. */
+      const lastCheck = new Map()
+      const checking = new Set()
+
+      async function checkEarly(entry) {
+        const sessionID = entry.sessionID
+        lastCheck.set(sessionID, now())
+        if (!usageCleared(await readUsage(), now())) return
+        const current = pending.get(sessionID)
+        if (!current || current.createdAt !== entry.createdAt || current.resumeAt <= now()) return
+        info(`${sessionID}: usage limit cleared before the reset time (usage reset?); continuing now`)
+        if (current.mode === "inline") {
+          // OpenCode is sleeping out the retry delay: stop it, then resume
+          // once the interrupt has landed.
+          stoppedEarly.add(sessionID)
+          await save({ ...current, mode: "stopping", resumeAt: now() })
+          await ctx.session.interrupt({ sessionID }).catch(async (error) => {
+            stoppedEarly.delete(sessionID)
+            await save({ ...current })
+            debug(`${sessionID}: could not stop the retry: ${error?.message ?? error}`)
+          })
+          return
+        }
+        await save({ ...current, resumeAt: now() })
+      }
+
       async function tick() {
         const at = now()
+        const interval = config.usageCheckMinutes * 60_000
+        if (interval > 0) {
+          for (const entry of pending.values()) {
+            const sessionID = entry.sessionID
+            if (entry.mode !== "resume" && entry.mode !== "inline") continue
+            if (entry.resumeAt - at <= 60_000 || firing.has(sessionID) || checking.has(sessionID)) continue
+            if (at - (lastCheck.get(sessionID) ?? entry.createdAt ?? 0) < interval) continue
+            checking.add(sessionID)
+            await checkEarly(entry)
+              .catch((error) => debug(`${sessionID}: ${error?.message ?? error}`))
+              .finally(() => checking.delete(sessionID))
+          }
+        }
         for (const entry of pending.values()) {
           if (entry.mode !== "resume" || entry.resumeAt > at || firing.has(entry.sessionID)) continue
           firing.add(entry.sessionID)
@@ -256,6 +300,12 @@ export function createAutoContinuePlugin({
               if (entry && entry.mode !== "resume") await save({ ...entry, mode: "resume" })
               return
             }
+            // Our own stop to resume early: resume on the next tick.
+            if (stoppedEarly.delete(sessionID)) {
+              const entry = pending.get(sessionID)
+              if (entry?.mode === "stopping") await save({ ...entry, mode: "resume" })
+              return
+            }
             streak.delete(sessionID)
             return drop(sessionID, `interrupted: ${event.data.reason}`)
           case "session.execution.started":
@@ -271,6 +321,7 @@ export function createAutoContinuePlugin({
             sessionInfo.delete(sessionID)
             headerLimits.delete(sessionID)
             lastLimit.delete(sessionID)
+            lastCheck.delete(sessionID)
             return drop(sessionID)
         }
       }

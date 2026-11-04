@@ -27,6 +27,7 @@ import {
   normalizeConfig,
   planResume,
   resetFromLimits,
+  usageCleared,
 } from "./logic.js"
 import { createLog } from "./log.js"
 import { createUsageReader } from "./usage.js"
@@ -349,9 +350,20 @@ export function createV1Server({
         if (!state.note) await toast(noteText(plan.resumeAt, now()))
         info(`${sessionID}: ChatGPT usage limit reached; holding the request until ${new Date(plan.resumeAt).toLocaleString()} (reset time from ${plan.source})`)
 
+        const interval = config.usageCheckMinutes * 60_000
+        let checkedAt = now()
         while (!state.cancelled) {
           const wait = state.plan.resumeAt - now()
           if (wait > 0) {
+            // Every few minutes: has the limit cleared early (a usage reset)?
+            if (interval > 0 && wait > 60_000 && now() - checkedAt >= interval) {
+              checkedAt = now()
+              if (usageCleared(await readUsage(), now())) {
+                info(`${sessionID}: usage limit cleared before the reset time (usage reset?); continuing now`)
+                break
+              }
+              continue
+            }
             await sleep(Math.min(wait, TICK_MS), state)
             continue
           }
@@ -473,8 +485,35 @@ export function createV1Server({
       }
     }
 
-    function tick() {
+    /** sessionID -> when the usage was last checked for an early resume. */
+    const lastCheck = new Map()
+    const checkingEarly = new Set()
+
+    async function checkEarly(entry) {
+      const sessionID = entry.sessionID
+      lastCheck.set(sessionID, now())
+      if (!usageCleared(await readUsage(), now())) return
+      const current = pending.get(sessionID)
+      if (!current || current.mode !== "resume" || current.createdAt !== entry.createdAt || current.resumeAt <= now()) return
+      info(`${sessionID}: usage limit cleared before the reset time (usage reset?); continuing now`)
+      await save({ ...current, resumeAt: now() })
+    }
+
+    async function tick() {
       if (restoring) return
+      const interval = config.usageCheckMinutes * 60_000
+      if (interval > 0) {
+        for (const entry of [...pending.values()]) {
+          const sessionID = entry.sessionID
+          if (entry.mode !== "resume" || entry.resumeAt - now() <= 60_000) continue
+          if (firing.has(sessionID) || checkingEarly.has(sessionID)) continue
+          if (now() - (lastCheck.get(sessionID) ?? entry.createdAt ?? 0) < interval) continue
+          checkingEarly.add(sessionID)
+          await checkEarly(entry)
+            .catch((error) => debug(`${sessionID}: ${error?.message ?? error}`))
+            .finally(() => checkingEarly.delete(sessionID))
+        }
+      }
       const at = now()
       for (const entry of pending.values()) {
         if (entry.mode !== "resume" || entry.resumeAt > at || firing.has(entry.sessionID)) continue
@@ -540,7 +579,7 @@ export function createV1Server({
           const sessionID = props.info?.id
           if (!sessionID) return
           cancelHold(sessionID, "session deleted")
-          for (const map of [assistants, limited, streak, parents]) map.delete(sessionID)
+          for (const map of [assistants, limited, streak, parents, lastCheck]) map.delete(sessionID)
           return drop(sessionID)
         }
       }
@@ -574,7 +613,7 @@ export function createV1Server({
 
     let restoring = true
     void restored.finally(() => (restoring = false))
-    const timer = every(tick, TICK_MS)
+    const timer = every(() => void tick(), TICK_MS)
     timer?.unref?.()
 
     return {

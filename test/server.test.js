@@ -197,3 +197,55 @@ test("disabled does nothing", async () => {
   const event = await h.trigger("retry", { sessionID: "ses_1", model, error: sharingLimit, decision: { retry: false } })
   assert.deepEqual(event.decision, { retry: false })
 })
+
+const blocked = (resetAt) => ({ rate_limit: { allowed: false, limit_reached: true, primary_window: { used_percent: 100, reset_at: resetAt } } })
+const cleared = { rate_limit: { allowed: true, limit_reached: false, primary_window: { used_percent: 0, reset_at: S(START) + 18_000 } } }
+
+test("durable resume: continues early when the usage endpoint shows the limit cleared", async () => {
+  const resetAt = S(START) + 5 * 3600
+  let usage = blocked(resetAt)
+  const h = harness({ credential: { type: "oauth", access: "tok" }, usage: () => usage })
+  await h.plugin.setup(h.ctx)
+  await h.trigger("retry", { sessionID: "ses_1", model, error: sharingLimit, decision: { retry: false } })
+  await h.emit("session.execution.failed", { sessionID: "ses_1", error: sharingLimit })
+  assert.equal(h.storage.get("pending:ses_1").mode, "resume")
+
+  await h.advance(5 * 60_000)
+  assert.equal(h.calls.synthetic.length, 0)
+  usage = cleared // the user redeemed a usage reset
+  await h.advance(5 * 60_000)
+  assert.equal(h.calls.synthetic.length, 1)
+  assert.equal(h.storage.has("pending:ses_1"), false)
+  assert.ok(h.logs.some((line) => line.includes("cleared before the reset time")))
+})
+
+test("in-place retry: stops OpenCode's wait and resumes when the limit clears early", async () => {
+  let usage = blocked(S(START) + 50 * 60)
+  const h = harness({ credential: { type: "oauth", access: "tok" }, usage: () => usage })
+  await h.plugin.setup(h.ctx)
+  const event = await h.trigger("retry", { sessionID: "ses_1", model, error: usageLimit(S(START) + 50 * 60), decision: { retry: false } })
+  assert.equal(event.decision.retry, true)
+  assert.equal(h.storage.get("pending:ses_1").mode, "inline")
+
+  usage = cleared
+  await h.advance(5 * 60_000)
+  assert.deepEqual(h.calls.interrupt, [{ sessionID: "ses_1" }])
+  assert.equal(h.storage.get("pending:ses_1").mode, "stopping")
+  assert.equal(h.calls.synthetic.length, 0)
+
+  await h.emit("session.execution.interrupted", { sessionID: "ses_1", reason: "user" })
+  assert.equal(h.storage.get("pending:ses_1").mode, "resume")
+  await h.advance(15_000)
+  assert.equal(h.calls.synthetic.length, 1)
+  assert.equal(h.storage.has("pending:ses_1"), false)
+})
+
+test("usageCheckMinutes: 0 turns the early check off", async () => {
+  const h = harness({ credential: { type: "oauth", access: "tok" }, usage: () => cleared, options: { usageCheckMinutes: 0, inlineMaxWaitMinutes: 0 } })
+  await h.plugin.setup(h.ctx)
+  await h.emit("session.execution.failed", { sessionID: "ses_1", error: usageLimit(S(START) + 3600) })
+  const requests = h.requests.length
+  await h.advance(30 * 60_000)
+  assert.equal(h.calls.synthetic.length, 0)
+  assert.equal(h.requests.length, requests)
+})

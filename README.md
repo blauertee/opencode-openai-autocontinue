@@ -31,7 +31,12 @@ requests while it waits.
    - Longer waits, such as a weekly limit, let the session stop with the usage
      error. The resume time is saved in plugin storage and checked against the
      wall clock, so it still fires after a laptop sleeps or OpenCode restarts.
-4. **Checks again, then continues.** When the time comes it reads the usage
+4. **Watches for an early reset.** While it waits, it reads the usage
+   endpoint every 5 minutes (`usageCheckMinutes`). If the limit has cleared
+   before the reported reset, for example because you used a usage reset, it
+   continues right away. During an in-place retry it stops OpenCode's countdown
+   and resumes the session instead.
+5. **Checks again, then continues.** When the time comes it reads the usage
    endpoint once more. If the account is still limited, it waits for the new
    reset. Otherwise it adds a short synthetic "continue where you left off"
    message that resumes the session, so finished work is not repeated.
@@ -62,6 +67,8 @@ no retry hook and no plugin storage, so it works a little differently there:
    2h 10m)." The note is removed just before the request goes out, so the
    model never sees it.
 3. **Esc cancels.** Interrupting the session drops the wait and the note.
+   If the limit clears early (a usage reset), the held request goes out at
+   the next usage check.
 4. **Fallback.** If OpenCode gives up anyway (for example it was restarted
    during the wait), the session stops with the usage error, the note stays
    under that error, and the session is continued with a synthetic message
@@ -128,6 +135,7 @@ Options go on the plugin entry:
 | `maxWaitHours` | `192` | Upper bound on any single wait. |
 | `maxConsecutiveResumes` | `8` | Stop after this many limits in a row right after resuming. `0` means no limit. |
 | `resumeSubagents` | `false` | Also resume subagent sessions. |
+| `usageCheckMinutes` | `5` | While waiting, check the usage endpoint this often and continue right away if the limit has cleared early (for example after a usage reset). `0` turns this off. |
 | `message` | *(see `src/logic.js`)* | Text of the synthetic continue message. |
 | `usageURL` | `https://chatgpt.com/backend-api/wham/usage` | Usage endpoint. |
 | `usageIntegrationID` | `openai` | Integration whose OAuth credential is used for the usage endpoint. |

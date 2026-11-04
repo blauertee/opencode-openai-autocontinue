@@ -14,9 +14,14 @@ export function bearerFrom(credential) {
   return { access: credential.access, accountID: typeof accountID === "string" && accountID ? accountID : null }
 }
 
-export function createUsageReader({ ctx, config, fetch: fetcher = globalThis.fetch, now = Date.now, log }) {
+/**
+ * `credential` overrides how the bearer is found (OpenCode 1 has no
+ * integration API); it returns `{ access, accountID }` or null.
+ */
+export function createUsageReader({ ctx, config, fetch: fetcher = globalThis.fetch, now = Date.now, log, credential: findCredential }) {
   let cached
   async function credential() {
+    if (findCredential) return findCredential()
     const connection = await ctx.integration?.connection?.active?.(config.usageIntegrationID)
     if (!connection) return null
     return bearerFrom(await ctx.integration.connection.resolve(connection))

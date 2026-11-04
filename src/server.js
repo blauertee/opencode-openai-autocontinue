@@ -1,4 +1,4 @@
-// OpenCode 2 server plugin: when a ChatGPT/Codex subscription usage limit
+// OpenCode 2 server plugin (the OpenCode 1 adapter is in v1.js): when a ChatGPT/Codex subscription usage limit
 // stops a session, wait until the limit resets (plus a small buffer) and then
 // continue that same session.
 //
@@ -30,10 +30,11 @@ import {
   resetFromError,
   resetFromLimits,
 } from "./logic.js"
-import { appendFile, mkdir } from "node:fs/promises"
-import os from "node:os"
-import path from "node:path"
+import { createLog, defaultLogFile } from "./log.js"
 import { createUsageReader } from "./usage.js"
+import { createV1Server } from "./v1.js"
+
+export { defaultLogFile }
 
 export const PLUGIN_ID = "openai-autocontinue"
 const PENDING_PREFIX = "pending:"
@@ -42,20 +43,6 @@ const SEND_RETRY_MS = 60_000
 const MAX_SEND_FAILURES = 5
 
 const unwrap = (value) => (value && typeof value === "object" && "data" in value && !("id" in value) ? value.data : value)
-
-/** Default log file: OpenCode discards a background server's console output. */
-export function defaultLogFile(env = process.env, home = os.homedir()) {
-  const state = env.XDG_STATE_HOME || path.join(home, ".local", "state")
-  return path.join(state, "opencode", "openai-autocontinue.log")
-}
-
-function fileLogger(file) {
-  let ready
-  return (message) => {
-    ready ??= mkdir(path.dirname(file), { recursive: true }).catch(() => {})
-    void ready.then(() => appendFile(file, `${new Date().toISOString()} ${message}\n`)).catch(() => {})
-  }
-}
 
 export function createAutoContinuePlugin({
   fetch: fetcher = globalThis.fetch,
@@ -68,17 +55,7 @@ export function createAutoContinuePlugin({
     id: PLUGIN_ID,
     async setup(ctx) {
       const config = normalizeConfig(ctx.options ?? {})
-      const toFile = config.logFile === false ? null : fileLogger(config.logFile ?? defaultLogFile())
-      const write =
-        logger ??
-        ((message) => {
-          console.warn(`[autocontinue] ${message}`)
-          toFile?.(message)
-        })
-      const info = (message) => write(message)
-      const debug = (message) => {
-        if (config.debug) write(message)
-      }
+      const { info, debug } = createLog(config, logger)
       if (!config.enabled) return
 
       const directory = ctx.location?.directory
@@ -353,4 +330,6 @@ export function createAutoContinuePlugin({
   }
 }
 
-export default createAutoContinuePlugin()
+// One default export for both major versions: OpenCode 2 calls `setup(ctx)`
+// (its loader ignores other keys), OpenCode 1 calls `server(input, options)`.
+export default { ...createAutoContinuePlugin(), server: createV1Server() }

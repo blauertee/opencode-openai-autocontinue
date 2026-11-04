@@ -1,6 +1,7 @@
 # opencode-openai-autocontinue
 
-An [OpenCode 2](https://opencode.ai) plugin for OpenAI models used through a
+An [OpenCode](https://opencode.ai) plugin (OpenCode 2, and OpenCode 1.x, see
+[below](#opencode-1x)) for OpenAI models used through a
 **ChatGPT/Codex subscription** (ChatGPT sign-in, not an API key). When the plan's
 usage limit stops a session, it works out when the limit resets, waits until then
 plus a small buffer, and continues the same session. It sends no extra model
@@ -45,6 +46,44 @@ Any of these cancels a pending resume:
 
 Subagent sessions are not resumed on their own (their parent is), and after 8
 limits in a row right after resuming, the plugin stops trying.
+
+## OpenCode 1.x
+
+The same package also loads on OpenCode 1.x (checked against 1.19.5). 1.x has
+no retry hook and no plugin storage, so it works a little differently there:
+
+1. **The session keeps working.** When a request fails and OpenCode schedules
+   a retry, the plugin checks the usage endpoint. If the plan's limit is
+   exhausted, it holds the next attempt back until the reset (plus the
+   buffer). The spinner keeps running, the original request is then sent
+   again, and no "continue" message is needed.
+2. **A note in the chat says when.** While it waits, the reply in progress
+   shows "ChatGPT usage limit reached. Continuing automatically at 14:05 (in
+   2h 10m)." The note is removed just before the request goes out, so the
+   model never sees it.
+3. **Esc cancels.** Interrupting the session drops the wait and the note.
+4. **Fallback.** If OpenCode gives up anyway (for example it was restarted
+   during the wait), the session stops with the usage error, the note stays
+   under that error, and the session is continued with a synthetic message
+   once the limit has reset. Sending the session a message cancels that.
+
+The OAuth credential is read from OpenCode's `auth.json`
+(`$XDG_DATA_HOME/opencode/auth.json`, or `OPENCODE_AUTH_CONTENT`). An expired
+token is not refreshed by the plugin; the usage lookup is skipped until OpenCode
+has refreshed it. Pending resumes are kept in
+`$XDG_STATE_HOME/opencode/openai-autocontinue-v1.json`. `inlineMaxWaitMinutes`
+and `/autocontinue-cancel` are OpenCode 2 only.
+
+Install on 1.x by adding the package to `plugin` in `opencode.json`:
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": [
+    ["git+https://github.com/blauertee/opencode-openai-autocontinue.git", { "bufferSeconds": 120 }]
+  ]
+}
+```
 
 ## Install
 
@@ -130,6 +169,12 @@ test/e2e/mock-openai.mjs`, then point the `openai` provider at it
 openai/gpt-5.5 "Say hi"`. This was checked against OpenCode 2.2.5 for retrying
 in place, for the durable resume, and for a resume that survives a service
 restart.
+
+On OpenCode 1.19.5 it was checked with `opencode serve` and a custom
+`@ai-sdk/openai` provider pointed at the mock (plugin options `providerIDs` and
+`usageURL` set to match): the held request resumed at the reset with the note
+removed, an abort during the hold cancelled it, and a hold interrupted by a
+restart was continued after the restart.
 
 ## Credits and license
 

@@ -1,9 +1,9 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
-import plugin from "../src/server.js"
-import { bearerFromAuth, createV1Server, fromV1Error, partID } from "../src/v1.js"
-import { isUsageLimitError } from "../src/logic.js"
-import { settle } from "./fake-context.js"
+import plugin from "../src/server.ts"
+import { bearerFromAuth, createV1Server, fromV1Error, partID } from "../src/v1.ts"
+import { isUsageLimitError } from "../src/logic.ts"
+import { settle } from "./fake-context.ts"
 
 const START = 1_800_000_000_000
 const S = (ms) => Math.floor(ms / 1000)
@@ -23,8 +23,8 @@ const assistant = (extra = {}) => ({
   ...extra,
 })
 
-const usageError = (resetsAt) => ({
-  name: "APIError",
+const usageError = (resetsAt: number) => ({
+  name: "APIError" as const,
   data: {
     message: "The usage limit has been reached",
     statusCode: 429,
@@ -34,7 +34,13 @@ const usageError = (resetsAt) => ({
   },
 })
 
-async function harness({ options = {}, usage = () => null, files: initial = {}, auth, raw = true } = {}) {
+async function harness({
+  options = {},
+  usage = () => null,
+  files: initial = {},
+  auth,
+  raw = true,
+}: { options?: Record<string, unknown>; usage?: () => unknown; files?: Record<string, string>; auth?: unknown; raw?: boolean } = {}) {
   let clock = START
   let tick
   const timers = []
@@ -42,7 +48,7 @@ async function harness({ options = {}, usage = () => null, files: initial = {}, 
   const parts = new Map()
   const calls = { patch: [], delete: [], prompt: [], toast: [] }
   const statuses = {}
-  const fs = new Map(Object.entries(initial))
+  const fs = new Map<string, string>(Object.entries(initial))
   const authContent = JSON.stringify({ openai: auth ?? { type: "oauth", access: "tok", refresh: "r", expires: START + 86_400_000, accountId: "acc" } })
   const messages = []
   const client = {
@@ -90,13 +96,14 @@ async function harness({ options = {}, usage = () => null, files: initial = {}, 
     env: { OPENCODE_AUTH_CONTENT: authContent, XDG_STATE_HOME: "/state", XDG_DATA_HOME: "/data" },
     home: "/home/u",
     files: {
-      readFile: async (file) => {
-        if (!fs.has(file)) throw new Error("ENOENT")
-        return fs.get(file)
+      readFile: async (file: string) => {
+        const text = fs.get(file)
+        if (text === undefined) throw new Error("ENOENT")
+        return text
       },
       writeFile: async (file, text) => void fs.set(file, text),
-      rename: async (from, to) => {
-        fs.set(to, fs.get(from))
+      rename: async (from: string, to: string) => {
+        fs.set(to, fs.get(from) ?? "")
         fs.delete(from)
       },
       mkdir: async () => {},
@@ -108,7 +115,8 @@ async function harness({ options = {}, usage = () => null, files: initial = {}, 
       return Response.json(body)
     },
   })
-  const hooks = await server({ client, directory: "/work" }, options)
+  // Only the calls the plugin makes; the cast is the boundary of the fake.
+  const hooks = await server({ client: client as any, directory: "/work" }, options)
   return {
     hooks,
     messages,
@@ -136,7 +144,8 @@ async function harness({ options = {}, usage = () => null, files: initial = {}, 
   }
 }
 
-const headersInput = { sessionID: "ses_1", agent: "build", model: { providerID: "openai", id: "gpt-6-sol" }, provider: { info: { id: "openai" } } }
+// The hook input in the shape OpenCode passes it, reduced to what the plugin reads.
+const headersInput: any = { sessionID: "ses_1", agent: "build", model: { providerID: "openai", id: "gpt-6-sol" }, provider: { info: { id: "openai" } } }
 
 async function startHold(h) {
   await h.emit("message.updated", { info: assistant() })
@@ -408,7 +417,7 @@ test("an expired token is not used for the usage lookup", () => {
 
 test("1.x usage errors are recognised through the shared logic", () => {
   assert.equal(isUsageLimitError(fromV1Error(usageError(1))), true)
-  assert.equal(isUsageLimitError(fromV1Error({ name: "APIError", data: { message: "Rate limit", statusCode: 429, responseBody: "{}" } })), false)
+  assert.equal(isUsageLimitError(fromV1Error({ name: "APIError", data: { message: "Rate limit", statusCode: 429, isRetryable: true, responseBody: "{}" } })), false)
 })
 
 test("part IDs sort in creation order", () => {

@@ -144,7 +144,7 @@ Options go on the plugin entry:
 | `maxConsecutiveResumes` | `8` | Stop after this many limits in a row right after resuming. `0` means no limit. |
 | `resumeSubagents` | `false` | Also resume subagent sessions. |
 | `usageCheckMinutes` | `5` | While waiting, check the usage endpoint this often and continue right away if the limit has cleared early (for example after a usage reset). `0` turns this off. |
-| `message` | *(see `src/logic.js`)* | Text of the synthetic continue message. |
+| `message` | *(see `src/logic.ts`)* | Text of the synthetic continue message. |
 | `usageURL` | `https://chatgpt.com/backend-api/wham/usage` | Usage endpoint. |
 | `usageIntegrationID` | `openai` | Integration whose OAuth credential is used for the usage endpoint. |
 | `logFile` | `$XDG_STATE_HOME/opencode/openai-autocontinue.log` | Where the plugin writes what it is doing. `false` turns it off. |
@@ -172,8 +172,19 @@ tail -f ~/.local/state/opencode/openai-autocontinue.log
 
 ## Development
 
+The plugin is written in TypeScript and shipped as `.ts` source with no build
+step: OpenCode runs plugins on Bun, which loads TypeScript directly. The code
+only uses erasable type syntax, so Node 22.18+ runs the tests without a
+compiler too. It is typed against the real plugin APIs of both majors
+(`@opencode-ai/plugin` 1.19.5 for `src/v1.ts`, `@opencode/plugin` 2.2.5 for
+`src/server.ts`), so a hook, event or field that does not exist in one of them
+fails the type check.
+
 ```sh
-npm test   # node:test, no dependencies
+npm install
+npm run typecheck   # strict tsc over src, looser over the test fakes
+npm test            # node:test (Node 22.18+)
+npm run check       # both
 ```
 
 `test/e2e/mock-openai.mjs` imitates a limited subscription backend, so the

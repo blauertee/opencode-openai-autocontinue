@@ -10,7 +10,7 @@ import {
   resetFromLimits,
   retryMayBeLimit,
   usageCleared,
-} from "../src/logic.js"
+} from "../src/logic.ts"
 
 const NOW = 1_800_000_000_000
 const NOW_S = NOW / 1000

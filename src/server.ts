@@ -1,4 +1,4 @@
-// OpenCode 2 server plugin (the OpenCode 1 adapter is in v1.js): when a ChatGPT/Codex subscription usage limit
+// OpenCode 2 server plugin (the OpenCode 1 adapter is in v1.ts): when a ChatGPT/Codex subscription usage limit
 // stops a session, wait until the limit resets (plus a small buffer) and then
 // continue that same session.
 //
@@ -27,13 +27,18 @@ import {
   limitsFromHeaders,
   normalizeConfig,
   planResume,
+  errorText,
   resetFromError,
+  type LimitError,
+  type Limits,
+  type Plan,
   resetFromLimits,
   usageCleared,
-} from "./logic.js"
-import { createLog, defaultLogFile } from "./log.js"
-import { createUsageReader } from "./usage.js"
-import { createV1Server } from "./v1.js"
+} from "./logic.ts"
+import type { Plugin } from "@opencode/plugin"
+import { createLog, defaultLogFile, type Logger } from "./log.ts"
+import { createUsageReader, type Fetch } from "./usage.ts"
+import { createV1Server } from "./v1.ts"
 
 export { defaultLogFile }
 
@@ -44,9 +49,25 @@ const SEND_RETRY_MS = 60_000
 const MAX_SEND_FAILURES = 5
 
 /** Model ID of an OpenCode 2 model reference (`{ id, providerID }`). */
-const modelIDOf = (ref) => ref?.id ?? ref?.modelID
+const modelIDOf = (ref: { id?: string; modelID?: string } | null | undefined): string | undefined => ref?.id ?? ref?.modelID
 
-const unwrap = (value) => (value && typeof value === "object" && "data" in value && !("id" in value) ? value.data : value)
+/** A pending resume, mirrored in plugin storage. */
+export interface Entry extends Plan {
+  sessionID: string
+  directory: string | undefined
+  mode: "inline" | "planned" | "resume" | "stopping"
+  deadline?: number
+  modelID?: string | null
+  streak: number
+  failures: number
+  createdAt: number
+}
+
+type Context = Plugin.Context
+type StorageValue = Parameters<Context["storage"]["set"]>[1]
+type SessionInfo = Awaited<ReturnType<Context["session"]["get"]>>
+type OpenCodeEvent = Context["event"]["subscribe"] extends (...args: any[]) => AsyncIterable<infer E> ? E : never
+type SessionID = Parameters<Context["session"]["get"]>[0]["sessionID"]
 
 export function createAutoContinuePlugin({
   fetch: fetcher = globalThis.fetch,
@@ -54,10 +75,16 @@ export function createAutoContinuePlugin({
   setInterval: every = globalThis.setInterval,
   clearInterval: stopEvery = globalThis.clearInterval,
   logger,
-} = {}) {
+}: {
+  fetch?: Fetch
+  now?: () => number
+  setInterval?: (fn: () => void, ms: number) => unknown
+  clearInterval?: (timer: any) => void
+  logger?: Logger
+} = {}): Plugin.Plugin {
   return {
     id: PLUGIN_ID,
-    async setup(ctx) {
+    async setup(ctx: Context) {
       const config = normalizeConfig(ctx.options ?? {})
       const { info, debug } = createLog(config, logger)
       if (!config.enabled) return
@@ -66,26 +93,26 @@ export function createAutoContinuePlugin({
       const readUsage = createUsageReader({ ctx, config, fetch: fetcher, now, log: debug })
 
       /** sessionID -> pending resume, mirrored in plugin storage. */
-      const pending = new Map()
+      const pending = new Map<string, Entry>()
       /** sessionID -> consecutive automatic resumes that hit the limit again. */
-      const streak = new Map()
+      const streak = new Map<string, number>()
       /** sessionID -> last usage-limit error seen by the retry hook, with its model. */
-      const lastLimit = new Map()
+      const lastLimit = new Map<string, { error: LimitError; model: { id?: string; providerID?: string } | undefined; at: number }>()
       /** sessionID -> passive x-codex-* limits from the latest response. */
-      const headerLimits = new Map()
+      const headerLimits = new Map<string, Limits>()
       /** Sessions this plugin is resuming right now. */
-      const resuming = new Set()
+      const resuming = new Set<string>()
       /** Sessions being processed by the ticker. */
-      const firing = new Set()
-      const sessionInfo = new Map()
+      const firing = new Set<string>()
+      const sessionInfo = new Map<string, SessionInfo>()
 
-      const allowedProvider = (providerID) => typeof providerID === "string" && config.providerIDs.includes(providerID)
-      const ours = (event) => !directory || !event?.location?.directory || event.location.directory === directory
+      const allowedProvider = (providerID: unknown): boolean => typeof providerID === "string" && config.providerIDs.includes(providerID)
+      const ours = (event: { location?: { directory?: string } }) => !directory || !event?.location?.directory || event.location.directory === directory
 
-      async function getSession(sessionID, fresh = false) {
-        if (!fresh && sessionInfo.has(sessionID)) return sessionInfo.get(sessionID)
+      async function getSession(sessionID: string, fresh = false): Promise<SessionInfo | null> {
+        if (!fresh && sessionInfo.has(sessionID)) return sessionInfo.get(sessionID) ?? null
         try {
-          const value = unwrap(await ctx.session.get({ sessionID }))
+          const value = await ctx.session.get({ sessionID: sessionID as SessionID })
           if (value) sessionInfo.set(sessionID, value)
           return value ?? null
         } catch {
@@ -93,31 +120,33 @@ export function createAutoContinuePlugin({
         }
       }
 
-      async function eligible(sessionID) {
+      async function eligible(sessionID: string) {
         if (config.resumeSubagents) return true
         const session = await getSession(sessionID)
         return !session?.parentID
       }
 
-      async function save(entry) {
+      async function save(entry: Entry) {
         pending.set(entry.sessionID, entry)
-        await ctx.storage.set(PENDING_PREFIX + entry.sessionID, entry).catch(() => {})
+        // Plain JSON: storage drops undefined fields like JSON.stringify does.
+        await ctx.storage.set(PENDING_PREFIX + entry.sessionID, entry as unknown as StorageValue).catch(() => {})
       }
 
-      async function drop(sessionID, reason) {
+      async function drop(sessionID: string, reason?: string) {
         const had = pending.delete(sessionID)
         await ctx.storage.remove(PENDING_PREFIX + sessionID).catch(() => {})
         if (had && reason) info(`${sessionID}: pending resume cancelled (${reason})`)
       }
 
-      async function plan(sessionID, error, modelID, deadline) {
+      async function plan(sessionID: string, error: LimitError, modelID: string | null | undefined, deadline: number) {
         const at = now()
         const fromError = resetFromError(error, at)
         const usage = fromError === null || fromError <= at ? await readUsage() : null
         return planResume({ error, usage, headers: headerLimits.get(sessionID), nowMs: now(), config, modelID, deadline })
       }
 
-      function describe(entry) {
+      function describe(entry: Entry | undefined) {
+        if (!entry) return "no resume pending"
         const when = new Date(entry.resumeAt)
         return `resuming at ${when.toLocaleString()} (in ${formatDelay(entry.resumeAt - now())}, reset time from ${entry.source})`
       }
@@ -173,7 +202,7 @@ export function createAutoContinuePlugin({
 
       /* -- Long waits: durable resume after the session failed ----------- */
 
-      async function onFailed(sessionID, error) {
+      async function onFailed(sessionID: string, error: LimitError) {
         if (!isUsageLimitError(error)) return drop(sessionID)
         const seen = lastLimit.get(sessionID)
         const model = seen?.model ?? (await getSession(sessionID, true))?.model
@@ -199,7 +228,7 @@ export function createAutoContinuePlugin({
         info(`${sessionID}: ChatGPT usage limit reached; ${describe(pending.get(sessionID))}`)
       }
 
-      async function fire(entry) {
+      async function fire(entry: Entry) {
         const sessionID = entry.sessionID
         const session = await getSession(sessionID, true)
         if (!session) return drop(sessionID, "session not found")
@@ -234,11 +263,11 @@ export function createAutoContinuePlugin({
           resuming.delete(sessionID)
           const failures = (entry.failures ?? 0) + 1
           if (failures >= MAX_SEND_FAILURES) {
-            await drop(sessionID, `could not resume: ${error?.message ?? error}`)
+            await drop(sessionID, `could not resume: ${errorText(error)}`)
             return
           }
           await save({ ...entry, failures, resumeAt: now() + SEND_RETRY_MS })
-          debug(`${sessionID}: resume failed (${error?.message ?? error}); trying again in a minute`)
+          debug(`${sessionID}: resume failed (${errorText(error)}); trying again in a minute`)
         }
       }
 
@@ -247,10 +276,10 @@ export function createAutoContinuePlugin({
       /** Sessions this plugin interrupted to resume early. */
       const stoppedEarly = new Set()
       /** sessionID -> when the usage was last checked for an early resume. */
-      const lastCheck = new Map()
-      const checking = new Set()
+      const lastCheck = new Map<string, number>()
+      const checking = new Set<string>()
 
-      async function checkEarly(entry) {
+      async function checkEarly(entry: Entry) {
         const sessionID = entry.sessionID
         lastCheck.set(sessionID, now())
         if (!usageCleared(await readUsage(), now(), entry.modelID ?? undefined)) return
@@ -265,7 +294,7 @@ export function createAutoContinuePlugin({
           await ctx.session.interrupt({ sessionID }).catch(async (error) => {
             stoppedEarly.delete(sessionID)
             await save({ ...current })
-            debug(`${sessionID}: could not stop the retry: ${error?.message ?? error}`)
+            debug(`${sessionID}: could not stop the retry: ${errorText(error)}`)
           })
           return
         }
@@ -283,7 +312,7 @@ export function createAutoContinuePlugin({
             if (at - (lastCheck.get(sessionID) ?? entry.createdAt ?? 0) < interval) continue
             checking.add(sessionID)
             await checkEarly(entry)
-              .catch((error) => debug(`${sessionID}: ${error?.message ?? error}`))
+              .catch((error) => debug(`${sessionID}: ${errorText(error)}`))
               .finally(() => checking.delete(sessionID))
           }
         }
@@ -291,24 +320,26 @@ export function createAutoContinuePlugin({
           if (entry.mode !== "resume" || entry.resumeAt > at || firing.has(entry.sessionID)) continue
           firing.add(entry.sessionID)
           void fire(entry)
-            .catch((error) => debug(`${entry.sessionID}: ${error?.message ?? error}`))
+            .catch((error) => debug(`${entry.sessionID}: ${errorText(error)}`))
             .finally(() => firing.delete(entry.sessionID))
         }
       }
 
       /* -- Session lifecycle --------------------------------------------- */
 
-      async function onEvent(event) {
-        const sessionID = event?.data?.sessionID
-        if (!sessionID || !ours(event)) return
+      async function onEvent(event: OpenCodeEvent) {
+        if (!ours(event)) return
         switch (event.type) {
           case "session.execution.failed":
-            return onFailed(sessionID, event.data.error)
-          case "session.execution.succeeded":
+            return onFailed(event.data.sessionID, event.data.error)
+          case "session.execution.succeeded": {
+            const sessionID = event.data.sessionID
             streak.delete(sessionID)
             lastLimit.delete(sessionID)
             return drop(sessionID)
-          case "session.execution.interrupted":
+          }
+          case "session.execution.interrupted": {
+            const sessionID = event.data.sessionID
             if (event.data.reason === "shutdown") {
               // An in-place retry dies with the process; resume it next start.
               const entry = pending.get(sessionID)
@@ -323,7 +354,9 @@ export function createAutoContinuePlugin({
             }
             streak.delete(sessionID)
             return drop(sessionID, `interrupted: ${event.data.reason}`)
-          case "session.execution.started":
+          }
+          case "session.execution.started": {
+            const sessionID = event.data.sessionID
             if (resuming.delete(sessionID)) return
             // New input while a resume was waiting: the user took over.
             if (pending.get(sessionID)?.mode === "resume") {
@@ -331,13 +364,16 @@ export function createAutoContinuePlugin({
               return drop(sessionID, "new input")
             }
             return
-          case "session.deleted":
+          }
+          case "session.deleted": {
+            const sessionID = event.data.sessionID
             streak.delete(sessionID)
             sessionInfo.delete(sessionID)
             headerLimits.delete(sessionID)
             lastLimit.delete(sessionID)
             lastCheck.delete(sessionID)
             return drop(sessionID)
+          }
         }
       }
 
@@ -356,37 +392,39 @@ export function createAutoContinuePlugin({
             },
           })
         })
-        ?.catch?.((error) => debug(`could not register the cancel command: ${error?.message ?? error}`))
+        ?.catch?.((error) => debug(`could not register the cancel command: ${errorText(error)}`))
 
       /* -- Restore and run ------------------------------------------------- */
 
       try {
-        let after
+        let after: string | undefined
         do {
           const page = await ctx.storage.scan({ prefix: PENDING_PREFIX, after, limit: 100 })
-          for (const { value } of page.entries ?? []) {
-            if (!value || typeof value !== "object" || typeof value.sessionID !== "string") continue
+          for (const { value: stored } of page.entries ?? []) {
+            if (!stored || typeof stored !== "object" || Array.isArray(stored)) continue
+            const value = stored as unknown as Partial<Entry>
+            if (typeof value.sessionID !== "string") continue
             if (directory && value.directory && value.directory !== directory) continue
             // Whatever was waiting before the restart is resumed by the clock now.
-            pending.set(value.sessionID, { ...value, mode: "resume" })
-            if (Number.isFinite(value.streak)) streak.set(value.sessionID, value.streak)
+            pending.set(value.sessionID, { ...(value as Entry), mode: "resume" })
+            if (typeof value.streak === "number" && Number.isFinite(value.streak)) streak.set(value.sessionID, value.streak)
           }
           after = page.next
         } while (after)
         if (pending.size) info(`restored ${pending.size} pending resume(s)`)
       } catch (error) {
-        debug(`could not restore pending resumes: ${error?.message ?? error}`)
+        debug(`could not restore pending resumes: ${errorText(error)}`)
       }
 
       const events = new AbortController()
       void (async () => {
         for await (const event of ctx.event.subscribe({ signal: events.signal })) {
-          await onEvent(event).catch((error) => debug(`event ${event?.type}: ${error?.message ?? error}`))
+          await onEvent(event).catch((error) => debug(`event ${event?.type}: ${errorText(error)}`))
         }
       })().catch(() => {})
 
       const timer = every(() => void tick(), TICK_MS)
-      timer?.unref?.()
+      ;(timer as { unref?: () => void } | undefined)?.unref?.()
 
       return async () => {
         stopEvery(timer)

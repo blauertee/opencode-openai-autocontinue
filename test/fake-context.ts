@@ -1,7 +1,17 @@
 // A minimal stand-in for the OpenCode 2 plugin context: only the pieces the
 // plugin touches, recording what it does.
 
-export function createFakeContext({ options = {}, directory = "/work", sessions = {}, credential, storage = new Map() } = {}) {
+import type { Plugin } from "@opencode/plugin"
+
+export interface FakeOptions {
+  options?: Record<string, unknown>
+  directory?: string
+  sessions?: Record<string, unknown>
+  credential?: unknown
+  storage?: Map<string, any>
+}
+
+export function createFakeContext({ options = {}, directory = "/work", sessions = {}, credential, storage = new Map() }: FakeOptions = {}) {
   const hooks = new Map()
   const queue = []
   let wake
@@ -43,7 +53,7 @@ export function createFakeContext({ options = {}, directory = "/work", sessions 
       interrupt: async (input) => void calls.interrupt.push(input),
     },
     event: {
-      subscribe: ({ signal } = {}) => ({
+      subscribe: ({ signal }: { signal?: AbortSignal } = {}) => ({
         async *[Symbol.asyncIterator]() {
           while (!signal?.aborted) {
             if (queue.length) {
@@ -60,7 +70,8 @@ export function createFakeContext({ options = {}, directory = "/work", sessions 
     },
   }
   return {
-    ctx,
+    // Only the pieces the plugin uses; the cast is the boundary of the fake.
+    ctx: ctx as unknown as Plugin.Context,
     calls,
     commands,
     storage,

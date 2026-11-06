@@ -27,6 +27,7 @@ import {
   normalizeConfig,
   planResume,
   resetFromLimits,
+  retryMayBeLimit,
   usageCleared,
 } from "./logic.js"
 import { createLog } from "./log.js"
@@ -288,11 +289,18 @@ export function createV1Server({
     /* -- Detecting a usage limit during OpenCode's retry ------------------ */
 
     async function check(sessionID, status) {
+      // Only a retry that can be the plan limit is checked: a header timeout,
+      // network error or overloaded server is OpenCode's to retry, even while
+      // some allowance on the account happens to be used up.
+      if (!retryMayBeLimit(status?.message)) {
+        limited.delete(sessionID)
+        return
+      }
       const assistant = await lastAssistant(sessionID)
       if (!allowedProvider(assistant?.providerID)) return
       if (!(await eligible(sessionID))) return
       const usage = await readUsage()
-      const blockedUntil = resetFromLimits(usage, now())
+      const blockedUntil = resetFromLimits(usage, now(), assistant.modelID)
       const looksLikeLimit = /usage[ _-]?limit/i.test(status?.message ?? "")
       if (blockedUntil === null && !(usage === null && looksLikeLimit)) {
         limited.delete(sessionID)
@@ -300,7 +308,7 @@ export function createV1Server({
       }
       // Usage unreadable but the message says it is the plan limit: wait the
       // fallback and let the retry find out.
-      const plan = planResume({ error: null, usage, headers: null, nowMs: now(), config })
+      const plan = planResume({ error: null, usage, headers: null, nowMs: now(), config, modelID: assistant.modelID })
       limited.set(sessionID, plan)
       debug(`${sessionID}: retry is a usage limit; holding until ${new Date(plan.resumeAt).toISOString()} (${plan.source})`)
     }
@@ -330,6 +338,10 @@ export function createV1Server({
       const state = { cancelled: false, wake: null, note: null, plan }
       holds.set(sessionID, state)
       const assistant = await lastAssistant(sessionID)
+      const modelID = assistant?.modelID
+      // Fixed when the hold starts: re-checks may move the resume time, but
+      // never past this, however often the limit turns out to last longer.
+      const deadline = now() + config.maxWaitHours * 3_600_000
       const entry = (extra = {}) => ({
         sessionID,
         directory,
@@ -338,6 +350,7 @@ export function createV1Server({
         note: state.note,
         streak: count,
         failures: 0,
+        deadline,
         model: assistant ? { providerID: assistant.providerID, modelID: assistant.modelID } : null,
         agent: assistant?.agent ?? null,
         createdAt: now(),
@@ -353,12 +366,16 @@ export function createV1Server({
         const interval = config.usageCheckMinutes * 60_000
         let checkedAt = now()
         while (!state.cancelled) {
-          const wait = state.plan.resumeAt - now()
+          if (now() >= deadline) {
+            info(`${sessionID}: held for maxWaitHours (${config.maxWaitHours}h); sending the request anyway`)
+            break
+          }
+          const wait = Math.min(state.plan.resumeAt, deadline) - now()
           if (wait > 0) {
             // Every few minutes: has the limit cleared early (a usage reset)?
             if (interval > 0 && wait > 60_000 && now() - checkedAt >= interval) {
               checkedAt = now()
-              if (usageCleared(await readUsage(), now())) {
+              if (usageCleared(await readUsage(), now(), modelID)) {
                 info(`${sessionID}: usage limit cleared before the reset time (usage reset?); continuing now`)
                 break
               }
@@ -368,9 +385,9 @@ export function createV1Server({
             continue
           }
           // Check again before spending a request.
-          const blockedUntil = resetFromLimits(await readUsage(), now())
+          const blockedUntil = resetFromLimits(await readUsage(), now(), modelID)
           if (blockedUntil !== null && blockedUntil + config.bufferSeconds * 1000 > now() + 30_000) {
-            const resumeAt = Math.min(blockedUntil + config.bufferSeconds * 1000, now() + config.maxWaitHours * 3_600_000)
+            const resumeAt = Math.min(blockedUntil + config.bufferSeconds * 1000, deadline)
             state.plan = { resumeAt, resetAt: blockedUntil, source: "usage" }
             if (state.note) await writeNote(sessionID, state.note.messageID, noteText(resumeAt, now()), state.note.partID)
             await save(entry())
@@ -420,7 +437,16 @@ export function createV1Server({
         return
       }
       const usage = await readUsage()
-      const plan = planResume({ error, usage, headers: limitsFromHeaders(error.response.headers, now()), nowMs: now(), config })
+      const deadline = now() + config.maxWaitHours * 3_600_000
+      const plan = planResume({
+        error,
+        usage,
+        headers: limitsFromHeaders(error.response.headers, now()),
+        nowMs: now(),
+        config,
+        modelID: assistant.modelID,
+        deadline,
+      })
       // The failed message is not sent to the model again, so the note can stay.
       const note = await writeNote(sessionID, assistant?.id, noteText(plan.resumeAt, now()))
       await save({
@@ -431,6 +457,7 @@ export function createV1Server({
         note,
         streak: count,
         failures: 0,
+        deadline,
         model: { providerID: assistant.providerID, modelID: assistant.modelID },
         agent: assistant.agent ?? null,
         createdAt: now(),
@@ -453,9 +480,11 @@ export function createV1Server({
       const status = statuses[sessionID]?.type
       if (status === "busy" || status === "retry") return drop(sessionID) // running again
 
-      const blockedUntil = resetFromLimits(await readUsage(), now())
-      if (blockedUntil !== null && blockedUntil + config.bufferSeconds * 1000 > now() + 30_000) {
-        const resumeAt = Math.min(blockedUntil + config.bufferSeconds * 1000, now() + config.maxWaitHours * 3_600_000)
+      // Entries saved before `deadline` existed are bounded from their creation.
+      const deadline = entry.deadline ?? (entry.createdAt ?? now()) + config.maxWaitHours * 3_600_000
+      const blockedUntil = resetFromLimits(await readUsage(), now(), entry.model?.modelID)
+      if (now() < deadline && blockedUntil !== null && blockedUntil + config.bufferSeconds * 1000 > now() + 30_000) {
+        const resumeAt = Math.min(blockedUntil + config.bufferSeconds * 1000, deadline)
         await save({ ...entry, resumeAt, resetAt: blockedUntil, source: "usage" })
         if (entry.note) await writeNote(sessionID, entry.note.messageID, noteText(resumeAt, now()), entry.note.partID)
         info(`${sessionID}: still limited; resuming at ${new Date(resumeAt).toLocaleString()}`)
@@ -492,7 +521,7 @@ export function createV1Server({
     async function checkEarly(entry) {
       const sessionID = entry.sessionID
       lastCheck.set(sessionID, now())
-      if (!usageCleared(await readUsage(), now())) return
+      if (!usageCleared(await readUsage(), now(), entry.model?.modelID)) return
       const current = pending.get(sessionID)
       if (!current || current.mode !== "resume" || current.createdAt !== entry.createdAt || current.resumeAt <= now()) return
       info(`${sessionID}: usage limit cleared before the reset time (usage reset?); continuing now`)

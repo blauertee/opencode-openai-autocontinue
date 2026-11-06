@@ -208,43 +208,65 @@ function blockingReset(limit, nowSec) {
   return null
 }
 
+/** Lowercase letters and digits only, so "GPT-5.3-Codex-Spark" matches "gpt-5.3-codex-spark". */
+const compact = (value) => String(value ?? "").toLowerCase().replace(/[^a-z0-9]/g, "")
+
 /**
- * When the account is allowed to make requests again (epoch ms), or null when
- * the usage data shows nothing blocking. The account-wide limit decides; a
- * model-scoped additional limit is used only when the account-wide one is not
- * blocking, so a reserve pool never stretches the wait for other models.
+ * Whether a model-scoped (additional) limit applies to `modelID`. The usage
+ * endpoint names these limits after the model they meter, so only an exact
+ * match (ignoring case and punctuation, and any `provider/` prefix) counts.
  */
-export function resetFromLimits(limits, nowMs = Date.now()) {
+export function limitAppliesTo(limit, modelID) {
+  if (typeof modelID !== "string" || !modelID) return false
+  const name = compact(limit?.name)
+  if (!name) return false
+  const model = compact(modelID.split("/").pop())
+  return name === model
+}
+
+/**
+ * When `modelID` may be used again (epoch ms), or null when the usage data
+ * shows nothing blocking it. The account-wide limit decides; a model-scoped
+ * additional limit counts only when it names the requested model, so an
+ * exhausted allowance of another model (or of a model that is unknown here)
+ * never holds this one.
+ */
+export function resetFromLimits(limits, nowMs = Date.now(), modelID) {
   if (!limits) return null
   const nowSec = Math.floor(nowMs / 1000)
   const main = blockingReset(limits.main, nowSec)
   if (main !== null) return main * 1000
-  const extra = limits.additional.map((limit) => blockingReset(limit, nowSec)).filter((value) => value !== null)
+  const extra = (limits.additional ?? [])
+    .filter((limit) => limitAppliesTo(limit, modelID))
+    .map((limit) => blockingReset(limit, nowSec))
+    .filter((value) => value !== null)
   return extra.length ? Math.min(...extra) * 1000 : null
 }
 
 /**
- * Whether usage data was read and shows nothing blocking, for example after
- * the user redeemed a usage reset. Unreadable usage (null) is not "cleared".
+ * Whether usage data was read and shows nothing blocking `modelID`, for
+ * example after the user redeemed a usage reset. Unreadable usage (null) is
+ * not "cleared".
  */
-export function usageCleared(limits, nowMs = Date.now()) {
-  return Boolean(limits) && resetFromLimits(limits, nowMs) === null
+export function usageCleared(limits, nowMs = Date.now(), modelID) {
+  return Boolean(limits) && resetFromLimits(limits, nowMs, modelID) === null
 }
 
-/** Whether the usage data says the account is still blocked. */
-export function stillBlocked(limits, nowMs = Date.now()) {
-  return resetFromLimits(limits, nowMs) !== null
+/** Whether the usage data says `modelID` is still blocked. */
+export function stillBlocked(limits, nowMs = Date.now(), modelID) {
+  return resetFromLimits(limits, nowMs, modelID) !== null
 }
 
 /**
  * Picks the moment to resume (epoch ms): the first known reset among the
  * sources, in order of reliability, plus the buffer; else `retryAfterMs`; else
- * the fallback wait. The result is clamped to `maxWaitHours`.
+ * the fallback wait. The result is clamped to `deadline` if given, else to
+ * `maxWaitHours` from now.
  */
-export function planResume({ error, usage, headers, nowMs = Date.now(), config }) {
+export function planResume({ error, usage, headers, nowMs = Date.now(), config, modelID, deadline }) {
   const sources = [
     ["error", () => resetFromError(error, nowMs)],
-    ["usage", () => resetFromLimits(usage, nowMs)],
+    ["usage", () => resetFromLimits(usage, nowMs, modelID)],
     ["headers", () => resetFromLimits(headers, nowMs)],
   ]
   let resetAt = null
@@ -263,8 +285,17 @@ export function planResume({ error, usage, headers, nowMs = Date.now(), config }
     resumeAt = nowMs + error.retryAfterMs + config.bufferSeconds * 1000
     source = "retry-after"
   } else resumeAt = nowMs + config.fallbackWaitMinutes * 60_000
-  const latest = nowMs + config.maxWaitHours * 3_600_000
+  const latest = Number.isFinite(deadline) ? deadline : nowMs + config.maxWaitHours * 3_600_000
   return { resumeAt: Math.min(resumeAt, latest), resetAt, source }
+}
+
+/**
+ * Whether an OpenCode retry status message could be a plan usage limit. Only
+ * such retries are checked against the usage endpoint; a timeout, network
+ * error or overloaded server is never turned into a hold.
+ */
+export function retryMayBeLimit(message) {
+  return typeof message === "string" && /usage[ _-]?limit|rate[ _-]?limit|too many requests|\b429\b|quota/i.test(message)
 }
 
 export function formatDelay(ms) {

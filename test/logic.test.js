@@ -8,6 +8,8 @@ import {
   planResume,
   resetFromError,
   resetFromLimits,
+  retryMayBeLimit,
+  usageCleared,
 } from "../src/logic.js"
 
 const NOW = 1_800_000_000_000
@@ -73,15 +75,38 @@ test("blocked without a full window waits for the nearest reset", () => {
   assert.equal(resetFromLimits(limits, NOW), (NOW_S + 100) * 1000)
 })
 
-test("a model-scoped limit is used only when the account limit is not blocking", () => {
+test("a model-scoped limit blocks only the model it names", () => {
   const limits = limitsFromUsage(
     {
-      rate_limit: { allowed: true, primary_window: { used_percent: 20, reset_at: NOW_S + 100 } },
-      additional_rate_limits: [{ limit_name: "spark", rate_limit: { limit_reached: true, primary_window: { used_percent: 100, reset_at: NOW_S + 900 } } }],
+      rate_limit: { allowed: true, primary_window: { used_percent: 10, reset_at: NOW_S + 100 } },
+      additional_rate_limits: [
+        { limit_name: "GPT-5.3-Codex-Spark", rate_limit: { limit_reached: true, primary_window: { used_percent: 100, reset_at: NOW_S + 7200 } } },
+      ],
     },
     NOW,
   )
-  assert.equal(resetFromLimits(limits, NOW), (NOW_S + 900) * 1000)
+  assert.equal(resetFromLimits(limits, NOW, "gpt-5.3-codex-spark"), (NOW_S + 7200) * 1000)
+  assert.equal(resetFromLimits(limits, NOW, "openai/gpt-5.3-codex-spark"), (NOW_S + 7200) * 1000)
+  // Another model, or no model at all, is not held by it.
+  assert.equal(resetFromLimits(limits, NOW, "gpt-5.3-codex"), null)
+  assert.equal(resetFromLimits(limits, NOW), null)
+  assert.equal(usageCleared(limits, NOW, "gpt-5.5"), true)
+  assert.equal(planResume({ error: null, usage: limits, nowMs: NOW, config: normalizeConfig({}), modelID: "gpt-5.5" }).source, "fallback")
+})
+
+test("a retry message is checked against the usage only when it can be a limit", () => {
+  assert.equal(retryMayBeLimit("The usage limit has been reached"), true)
+  assert.equal(retryMayBeLimit("Too Many Requests"), true)
+  assert.equal(retryMayBeLimit("Rate limit reached"), true)
+  assert.equal(retryMayBeLimit("Provider response headers timed out after 300000ms"), false)
+  assert.equal(retryMayBeLimit("Provider is overloaded"), false)
+  assert.equal(retryMayBeLimit("fetch failed"), false)
+  assert.equal(retryMayBeLimit(undefined), false)
+})
+
+test("planResume respects an absolute deadline", () => {
+  const usage = limitsFromUsage({ rate_limit: { limit_reached: true, primary_window: { used_percent: 100, reset_at: NOW_S + 86400 } } }, NOW)
+  assert.equal(planResume({ error: null, usage, nowMs: NOW, config: normalizeConfig({}), deadline: NOW + 3_600_000 }).resumeAt, NOW + 3_600_000)
 })
 
 test("reads passive x-codex headers", () => {

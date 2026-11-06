@@ -212,6 +212,43 @@ test("a retry that is not the plan limit is left to OpenCode", async () => {
   assert.equal(h.calls.patch.length, 0)
 })
 
+test("a header timeout retry is never turned into a hold", async () => {
+  const h = await harness({ usage: () => blockedUsage(START + 60 * 60_000) })
+  await h.emit("message.updated", { info: assistant() })
+  await h.emit("session.status", {
+    sessionID: "ses_1",
+    status: { type: "retry", attempt: 1, message: "Provider response headers timed out after 300000ms", next: START + 2000 },
+  })
+  await h.hooks["chat.headers"](headersInput, { headers: {} })
+  assert.equal(h.requests.length, 0)
+  assert.equal(h.calls.patch.length, 0)
+})
+
+test("another model's exhausted allowance does not hold this model", async () => {
+  const usage = {
+    rate_limit: { allowed: true, limit_reached: false, primary_window: { used_percent: 10, reset_at: S(START) + 18_000 } },
+    additional_rate_limits: [
+      { limit_name: "GPT-5.3-Codex-Spark", rate_limit: { limit_reached: true, primary_window: { used_percent: 100, reset_at: S(START) + 7200 } } },
+    ],
+  }
+  const h = await harness({ usage: () => usage })
+  await h.emit("message.updated", { info: assistant() })
+  await h.emit("session.status", { sessionID: "ses_1", status: { type: "retry", attempt: 1, message: "Rate limit reached", next: START + 2000 } })
+  await h.hooks["chat.headers"](headersInput, { headers: {} })
+  assert.equal(h.calls.patch.length, 0)
+})
+
+test("hold: never lasts longer than maxWaitHours, however often the limit is extended", async () => {
+  // The usage keeps reporting a reset two hours away.
+  const h = await harness({ usage: () => blockedUsage(h.now() + 2 * 3_600_000), options: { maxWaitHours: 3, usageCheckMinutes: 0 } })
+  const hold = await startHold(h)
+  for (let step = 0; step < 14 && !hold.released(); step++) await h.advance(15 * 60_000)
+  await hold.run
+  assert.equal(hold.released(), true)
+  assert.ok(h.now() - START <= 3 * 3_600_000 + 15 * 60_000)
+  assert.ok(h.logs.some((line) => line.includes("held for maxWaitHours")))
+})
+
 test("other providers are ignored", async () => {
   const h = await harness({ usage: () => blockedUsage(START + 60_000) })
   await h.emit("message.updated", { info: assistant({ providerID: "anthropic" }) })

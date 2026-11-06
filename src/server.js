@@ -43,6 +43,9 @@ const TICK_MS = 15_000
 const SEND_RETRY_MS = 60_000
 const MAX_SEND_FAILURES = 5
 
+/** Model ID of an OpenCode 2 model reference (`{ id, providerID }`). */
+const modelIDOf = (ref) => ref?.id ?? ref?.modelID
+
 const unwrap = (value) => (value && typeof value === "object" && "data" in value && !("id" in value) ? value.data : value)
 
 export function createAutoContinuePlugin({
@@ -107,11 +110,11 @@ export function createAutoContinuePlugin({
         if (had && reason) info(`${sessionID}: pending resume cancelled (${reason})`)
       }
 
-      async function plan(sessionID, error) {
+      async function plan(sessionID, error, modelID, deadline) {
         const at = now()
         const fromError = resetFromError(error, at)
         const usage = fromError === null || fromError <= at ? await readUsage() : null
-        return planResume({ error, usage, headers: headerLimits.get(sessionID), nowMs: now(), config })
+        return planResume({ error, usage, headers: headerLimits.get(sessionID), nowMs: now(), config, modelID, deadline })
       }
 
       function describe(entry) {
@@ -133,7 +136,8 @@ export function createAutoContinuePlugin({
         if (!allowedProvider(event.model?.providerID) || !isUsageLimitError(event.error)) return
         lastLimit.set(event.sessionID, { error: event.error, model: event.model, at: now() })
         if (!(await eligible(event.sessionID))) return
-        const result = await plan(event.sessionID, event.error)
+        const deadline = now() + config.maxWaitHours * 3_600_000
+        const result = await plan(event.sessionID, event.error, modelIDOf(event.model), deadline)
         const wait = Math.max(0, result.resumeAt - now())
         if (config.inlineMaxWaitMinutes > 0 && wait <= config.inlineMaxWaitMinutes * 60_000) {
           event.decision = { retry: true, delay: wait }
@@ -142,6 +146,8 @@ export function createAutoContinuePlugin({
             directory,
             mode: "inline",
             ...result,
+            deadline,
+            modelID: modelIDOf(event.model) ?? null,
             streak: streak.get(event.sessionID) ?? 0,
             failures: 0,
             createdAt: now(),
@@ -157,6 +163,8 @@ export function createAutoContinuePlugin({
           directory,
           mode: "planned",
           ...result,
+          deadline,
+          modelID: modelIDOf(event.model) ?? null,
           streak: streak.get(event.sessionID) ?? 0,
           failures: 0,
           createdAt: now(),
@@ -168,7 +176,8 @@ export function createAutoContinuePlugin({
       async function onFailed(sessionID, error) {
         if (!isUsageLimitError(error)) return drop(sessionID)
         const seen = lastLimit.get(sessionID)
-        const providerID = seen?.model?.providerID ?? (await getSession(sessionID, true))?.model?.providerID
+        const model = seen?.model ?? (await getSession(sessionID, true))?.model
+        const providerID = model?.providerID
         if (!allowedProvider(providerID)) return
         if (!(await eligible(sessionID))) return
         const count = (streak.get(sessionID) ?? 0) + 1
@@ -180,9 +189,13 @@ export function createAutoContinuePlugin({
           return
         }
         const previous = pending.get(sessionID)
+        const modelID = modelIDOf(model) ?? previous?.modelID ?? null
+        const deadline = previous && previous.resumeAt > now() && previous.deadline ? previous.deadline : now() + config.maxWaitHours * 3_600_000
         const result =
-          previous && previous.resumeAt > now() ? { resumeAt: previous.resumeAt, resetAt: previous.resetAt, source: previous.source } : await plan(sessionID, error)
-        await save({ sessionID, directory, mode: "resume", ...result, streak: count, failures: 0, createdAt: now() })
+          previous && previous.resumeAt > now()
+            ? { resumeAt: previous.resumeAt, resetAt: previous.resetAt, source: previous.source }
+            : await plan(sessionID, error, modelID, deadline)
+        await save({ sessionID, directory, mode: "resume", ...result, deadline, modelID, streak: count, failures: 0, createdAt: now() })
         info(`${sessionID}: ChatGPT usage limit reached; ${describe(pending.get(sessionID))}`)
       }
 
@@ -195,10 +208,12 @@ export function createAutoContinuePlugin({
 
         // Re-check before spending a request: resume only when the usage data
         // no longer shows a blocking window (or cannot be read).
+        // Entries saved before `deadline` existed are bounded from their creation.
+        const deadline = entry.deadline ?? (entry.createdAt ?? now()) + config.maxWaitHours * 3_600_000
         const usage = await readUsage()
-        const blockedUntil = resetFromLimits(usage, now())
-        if (blockedUntil !== null && blockedUntil + config.bufferSeconds * 1000 > now() + 30_000) {
-          const resumeAt = Math.min(blockedUntil + config.bufferSeconds * 1000, now() + config.maxWaitHours * 3_600_000)
+        const blockedUntil = resetFromLimits(usage, now(), entry.modelID ?? undefined)
+        if (now() < deadline && blockedUntil !== null && blockedUntil + config.bufferSeconds * 1000 > now() + 30_000) {
+          const resumeAt = Math.min(blockedUntil + config.bufferSeconds * 1000, deadline)
           await save({ ...entry, resumeAt, resetAt: blockedUntil, source: "usage" })
           info(`${sessionID}: still limited; ${describe(pending.get(sessionID))}`)
           return
@@ -238,7 +253,7 @@ export function createAutoContinuePlugin({
       async function checkEarly(entry) {
         const sessionID = entry.sessionID
         lastCheck.set(sessionID, now())
-        if (!usageCleared(await readUsage(), now())) return
+        if (!usageCleared(await readUsage(), now(), entry.modelID ?? undefined)) return
         const current = pending.get(sessionID)
         if (!current || current.createdAt !== entry.createdAt || current.resumeAt <= now()) return
         info(`${sessionID}: usage limit cleared before the reset time (usage reset?); continuing now`)

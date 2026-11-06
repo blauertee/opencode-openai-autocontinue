@@ -57,10 +57,13 @@ limits in a row right after resuming, the plugin stops trying.
 The same package also loads on OpenCode 1.x (checked against 1.19.5). 1.x has
 no retry hook and no plugin storage, so it works a little differently there:
 
-1. **The session keeps working.** When a request fails and OpenCode schedules
-   a retry, the plugin checks the usage endpoint. If the plan's limit is
-   exhausted, it holds the next attempt back until the reset (plus the
-   buffer). The spinner keeps running, the original request is then sent
+1. **The session keeps working.** When a request fails with what can be a
+   usage or rate limit and OpenCode schedules a retry, the plugin checks the
+   usage endpoint. Other retries (header timeouts, network errors, overloaded
+   servers) are left to OpenCode. If the plan's limit is exhausted, it holds
+   the next attempt back until the reset (plus the buffer). A model-specific
+   allowance only counts for the model it names, so a used-up allowance of
+   another model never holds this one. The spinner keeps running, the original request is then sent
    again, and no "continue" message is needed.
 2. **A note in the chat says when.** While it waits, the reply in progress
    shows "ChatGPT usage limit reached. Continuing automatically at 14:05 (in
@@ -132,7 +135,7 @@ Options go on the plugin entry:
 | `bufferSeconds` | `60` | Extra wait after the reported reset. |
 | `inlineMaxWaitMinutes` | `60` | Longest wait handled by retrying in place. `0` always uses the durable resume. |
 | `fallbackWaitMinutes` | `15` | Wait used when no reset time can be found. |
-| `maxWaitHours` | `192` | Upper bound on any single wait. |
+| `maxWaitHours` | `192` | Upper bound on any single wait, counted from when the wait started; re-checks that find the limit still in place never extend it past this. |
 | `maxConsecutiveResumes` | `8` | Stop after this many limits in a row right after resuming. `0` means no limit. |
 | `resumeSubagents` | `false` | Also resume subagent sessions. |
 | `usageCheckMinutes` | `5` | While waiting, check the usage endpoint this often and continue right away if the limit has cleared early (for example after a usage reset). `0` turns this off. |

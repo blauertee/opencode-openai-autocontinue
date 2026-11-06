@@ -65,10 +65,15 @@ no retry hook and no plugin storage, so it works a little differently there:
    allowance only counts for the model it names, so a used-up allowance of
    another model never holds this one. The spinner keeps running, the original request is then sent
    again, and no "continue" message is needed.
-2. **A note in the chat says when.** While it waits, the reply in progress
-   shows "ChatGPT usage limit reached. Continuing automatically at 14:05 (in
-   2h 10m)." The note is removed just before the request goes out, so the
-   model never sees it.
+2. **The chat says the plugin is holding it.** While it waits, the reply in
+   progress (or, if none is in progress, the latest reply) shows a note like
+   "⏸ Held by the opencode-openai-autocontinue plugin: this request has not
+   been sent. Reason: the ChatGPT usage endpoint reports the plan limit for
+   gpt-5.5 as used up. It is sent automatically at 14:05 (in 2h 10m). Press
+   Esc to cancel, …". The note is removed just before the request goes out,
+   so the model never sees it. If no note can be written, a toast says the
+   same thing and repeats every 5 minutes, and the log file always gets a
+   `HOLDING the request (not sent)` line.
 3. **Esc cancels.** Interrupting the session drops the wait and the note.
    If the limit clears early (a usage reset), the held request goes out at
    the next usage check.

@@ -34,7 +34,7 @@ const usageError = (resetsAt) => ({
   },
 })
 
-async function harness({ options = {}, usage = () => null, files: initial = {}, auth } = {}) {
+async function harness({ options = {}, usage = () => null, files: initial = {}, auth, raw = true } = {}) {
   let clock = START
   let tick
   const timers = []
@@ -44,8 +44,9 @@ async function harness({ options = {}, usage = () => null, files: initial = {}, 
   const statuses = {}
   const fs = new Map(Object.entries(initial))
   const authContent = JSON.stringify({ openai: auth ?? { type: "oauth", access: "tok", refresh: "r", expires: START + 86_400_000, accountId: "acc" } })
+  const messages = []
   const client = {
-    _client: {
+    _client: raw && {
       patch: async ({ path, body }) => {
         calls.patch.push({ path, body })
         parts.set(path.partID, body)
@@ -59,7 +60,7 @@ async function harness({ options = {}, usage = () => null, files: initial = {}, 
     },
     session: {
       get: async ({ path }) => ({ data: { id: path.id } }),
-      messages: async () => ({ data: [] }),
+      messages: async () => ({ data: messages }),
       status: async () => ({ data: statuses }),
       promptAsync: async (input) => {
         calls.prompt.push(input)
@@ -110,6 +111,7 @@ async function harness({ options = {}, usage = () => null, files: initial = {}, 
   const hooks = await server({ client, directory: "/work" }, options)
   return {
     hooks,
+    messages,
     calls,
     parts,
     logs,
@@ -161,7 +163,9 @@ test("hold: keeps the request back until the reset and shows a note in the chat"
   const note = h.calls.patch[0].body
   assert.equal(note.messageID, "msg_a")
   assert.equal(note.type, "text")
-  assert.match(note.text, /Continuing automatically at .* \(in 31m\)/)
+  assert.match(note.text, /^⏸ Held by the opencode-openai-autocontinue plugin: this request has not been sent\./)
+  assert.match(note.text, /usage endpoint reports the plan limit for gpt-6-sol as used up/)
+  assert.match(note.text, /sent automatically at .* \(in 31m\)\. Press Esc to cancel/)
   assert.equal(h.requests[0].init.headers.Authorization, "Bearer tok")
   assert.equal(h.requests[0].init.headers["ChatGPT-Account-Id"], "acc")
   assert.equal(h.state().ses_1.mode, "hold")
@@ -189,6 +193,37 @@ test("hold: still limited at the reset time keeps waiting and updates the note",
   await h.advance(50 * 60_000)
   await hold.run
   assert.equal(hold.released(), true)
+})
+
+test("hold: with no reply in progress, the note goes on the latest assistant message", async () => {
+  const resetAt = START + 30 * 60_000
+  const h = await harness({ usage: () => (h.now() < resetAt ? blockedUsage(resetAt) : freeUsage) })
+  h.messages.push({ info: assistant({ id: "msg_done", time: { created: START, completed: START + 1 } }) })
+  await h.emit("message.updated", { info: assistant({ id: "msg_done", time: { created: START, completed: START + 1 } }) })
+  await h.emit("session.status", { sessionID: "ses_1", status: { type: "retry", attempt: 1, message: "The usage limit has been reached", next: h.now() + 2000 } })
+  const run = h.hooks["chat.headers"](headersInput, { headers: {} })
+  await settle()
+  assert.equal(h.calls.patch.length, 1)
+  assert.equal(h.calls.patch[0].body.messageID, "msg_done")
+  assert.equal(h.calls.toast.length, 0)
+  await h.advance(32 * 60_000)
+  await run
+  assert.equal(h.parts.size, 0)
+})
+
+test("hold: without a chat note, a toast names the plugin and repeats while it holds", async () => {
+  const resetAt = START + 30 * 60_000
+  const h = await harness({ usage: () => (h.now() < resetAt ? blockedUsage(resetAt) : freeUsage), raw: false })
+  const hold = await startHold(h)
+  assert.equal(h.calls.patch.length, 0)
+  assert.equal(h.calls.toast.length, 1)
+  assert.equal(h.calls.toast[0].body.title, "opencode-openai-autocontinue")
+  assert.match(h.calls.toast[0].body.message, /Held by the opencode-openai-autocontinue plugin/)
+  assert.ok(h.logs.some((line) => line.includes("HOLDING the request (not sent)") && line.includes("no note could be written")))
+  await h.advance(11 * 60_000)
+  assert.ok(h.calls.toast.length >= 2)
+  await h.advance(21 * 60_000)
+  await hold.run
 })
 
 test("hold: Esc cancels it and removes the note", async () => {
@@ -269,7 +304,7 @@ test("fallback: after OpenCode gives up, resumes with a synthetic prompt at the 
   assert.equal(entry.resumeAt, resetAt + 60_000)
   const note = h.parts.get(entry.note.partID)
   assert.equal(note.messageID, "msg_a")
-  assert.match(note.text, /Continuing automatically/)
+  assert.match(note.text, /The opencode-openai-autocontinue plugin will continue this session at .* \(in 3h 1m\)/)
 
   await h.advance(3 * 3_600_000)
   assert.equal(h.calls.prompt.length, 0)
@@ -291,7 +326,7 @@ test("fallback: new input cancels the pending resume", async () => {
   const { note } = h.state().ses_1
   await h.emit("session.status", { sessionID: "ses_1", status: { type: "busy" } })
   assert.equal(h.state().ses_1, undefined)
-  assert.equal(h.parts.get(note.partID).text, "Automatic continue cancelled.")
+  assert.equal(h.parts.get(note.partID).text, "Automatic continue by the opencode-openai-autocontinue plugin cancelled.")
   await h.advance(2 * 3_600_000)
   assert.equal(h.calls.prompt.length, 0)
 })

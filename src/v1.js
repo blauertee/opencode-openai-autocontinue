@@ -111,15 +111,59 @@ export function fromV1Error(error) {
 
 const result = (response) => (response && typeof response === "object" && "data" in response ? response.data : response)
 
-function noteText(resumeAt, nowMs) {
+export const PLUGIN_NAME = "opencode-openai-autocontinue"
+
+function at(resumeAt, nowMs) {
   const when = new Date(resumeAt)
   const sameDay = new Date(nowMs).toDateString() === when.toDateString()
   const time = sameDay
     ? when.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
     : when.toLocaleString([], { weekday: "short", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })
   const delay = resumeAt - nowMs < 60_000 ? "in under a minute" : `in ${formatDelay(resumeAt - nowMs)}`
-  return `ChatGPT usage limit reached. Continuing automatically at ${time} (${delay}).`
+  return `${time} (${delay})`
 }
+
+/** Why the plugin believes the limit is reached, by where the reset time came from. */
+function reason(source, modelID) {
+  const model = modelID ? ` for ${modelID}` : ""
+  switch (source) {
+    case "usage":
+      return `the ChatGPT usage endpoint reports the plan limit${model} as used up`
+    case "error":
+      return "OpenAI answered that the ChatGPT usage limit is reached"
+    case "headers":
+      return "OpenAI's rate-limit headers report the plan limit as used up"
+    case "retry-after":
+      return "OpenAI reported the usage limit and asked to retry later"
+    default:
+      return "OpenCode's retry says the usage limit is reached, but no reset time is known, so the plugin checks again then"
+  }
+}
+
+/**
+ * The note shown while the plugin holds a request back. It names the plugin,
+ * says that nothing has been sent and how to cancel, so a held session is
+ * never mistaken for a slow model or a stuck provider.
+ */
+export function holdNoteText(plan, nowMs, modelID) {
+  return (
+    `⏸ Held by the ${PLUGIN_NAME} plugin: this request has not been sent. ` +
+    `Reason: ${reason(plan.source, modelID)}. ` +
+    `It is sent automatically at ${at(plan.resumeAt, nowMs)}. ` +
+    `Press Esc to cancel, or set the plugin option "enabled": false to turn this off.`
+  )
+}
+
+/** The note left under a session that stopped and will be continued later. */
+export function resumeNoteText(plan, nowMs, modelID) {
+  return (
+    `⏸ Stopped by the ChatGPT usage limit (${reason(plan.source, modelID)}). ` +
+    `The ${PLUGIN_NAME} plugin will continue this session at ${at(plan.resumeAt, nowMs)}. ` +
+    `Sending a message or pressing Esc cancels that.`
+  )
+}
+
+const TOAST_EVERY_MS = 5 * 60_000
 
 /* -- Plugin ----------------------------------------------------------------- */
 
@@ -280,10 +324,28 @@ export function createV1Server({
       }
     }
 
-    async function toast(message, variant = "info") {
+    async function toast(message, variant = "warning") {
       try {
-        await client.tui?.showToast?.({ body: { title: "Auto-continue", message, variant, duration: 10_000 } })
+        await client.tui?.showToast?.({ body: { title: PLUGIN_NAME, message, variant, duration: 30_000 } })
       } catch {}
+    }
+
+    /**
+     * The message a hold note goes into: the reply in progress, else the
+     * session's latest assistant message (the note is deleted before the
+     * request goes out, so the model never sees it either way).
+     */
+    async function noteTarget(sessionID, assistant) {
+      if (assistant && !assistant.completed) return assistant.id
+      try {
+        const messages = result(await client.session.messages({ path: { id: sessionID } })) ?? []
+        const replies = messages.map((item) => item?.info).filter((info) => info?.role === "assistant")
+        const target = replies.findLast((info) => !info.time?.completed) ?? replies.at(-1)
+        if (target?.id) return target.id
+      } catch (error) {
+        debug(`${sessionID}: could not list messages for the note: ${error?.message ?? error}`)
+      }
+      return assistant?.id ?? null
     }
 
     /* -- Detecting a usage limit during OpenCode's retry ------------------ */
@@ -357,11 +419,17 @@ export function createV1Server({
         ...extra,
       })
       try {
-        state.note = await writeNote(sessionID, assistant && !assistant.completed ? assistant.id : null, noteText(plan.resumeAt, now()))
+        state.note = await writeNote(sessionID, await noteTarget(sessionID, assistant), holdNoteText(plan, now(), modelID))
         // Saved so a restart during the hold still resumes the session.
         await save(entry())
-        if (!state.note) await toast(noteText(plan.resumeAt, now()))
-        info(`${sessionID}: ChatGPT usage limit reached; holding the request until ${new Date(plan.resumeAt).toLocaleString()} (reset time from ${plan.source})`)
+        // Without a note in the chat, a toast says it instead, again every few
+        // minutes for as long as the hold lasts.
+        let toastedAt = now()
+        if (!state.note) await toast(holdNoteText(plan, now(), modelID))
+        info(
+          `${sessionID}: HOLDING the request (not sent) until ${new Date(plan.resumeAt).toLocaleString()}: ` +
+            `${reason(plan.source, modelID)}${state.note ? "" : "; no note could be written to the chat"}`,
+        )
 
         const interval = config.usageCheckMinutes * 60_000
         let checkedAt = now()
@@ -371,6 +439,10 @@ export function createV1Server({
             break
           }
           const wait = Math.min(state.plan.resumeAt, deadline) - now()
+          if (!state.note && now() - toastedAt >= TOAST_EVERY_MS) {
+            toastedAt = now()
+            await toast(holdNoteText(state.plan, now(), modelID))
+          }
           if (wait > 0) {
             // Every few minutes: has the limit cleared early (a usage reset)?
             if (interval > 0 && wait > 60_000 && now() - checkedAt >= interval) {
@@ -389,7 +461,7 @@ export function createV1Server({
           if (blockedUntil !== null && blockedUntil + config.bufferSeconds * 1000 > now() + 30_000) {
             const resumeAt = Math.min(blockedUntil + config.bufferSeconds * 1000, deadline)
             state.plan = { resumeAt, resetAt: blockedUntil, source: "usage" }
-            if (state.note) await writeNote(sessionID, state.note.messageID, noteText(resumeAt, now()), state.note.partID)
+            if (state.note) await writeNote(sessionID, state.note.messageID, holdNoteText(state.plan, now(), modelID), state.note.partID)
             await save(entry())
             info(`${sessionID}: still limited; holding until ${new Date(resumeAt).toLocaleString()}`)
             continue
@@ -448,7 +520,7 @@ export function createV1Server({
         deadline,
       })
       // The failed message is not sent to the model again, so the note can stay.
-      const note = await writeNote(sessionID, assistant?.id, noteText(plan.resumeAt, now()))
+      const note = await writeNote(sessionID, assistant?.id, resumeNoteText(plan, now(), assistant.modelID))
       await save({
         sessionID,
         directory,
@@ -462,13 +534,13 @@ export function createV1Server({
         agent: assistant.agent ?? null,
         createdAt: now(),
       })
-      if (!note) await toast(noteText(plan.resumeAt, now()))
+      if (!note) await toast(resumeNoteText(plan, now(), assistant.modelID))
       info(`${sessionID}: ChatGPT usage limit reached; resuming at ${new Date(plan.resumeAt).toLocaleString()} (reset time from ${plan.source})`)
     }
 
     async function cancelResume(sessionID, reason) {
       const entry = await drop(sessionID, reason)
-      if (entry?.mode === "resume" && entry.note) await writeNote(sessionID, entry.note.messageID, "Automatic continue cancelled.", entry.note.partID)
+      if (entry?.mode === "resume" && entry.note) await writeNote(sessionID, entry.note.messageID, `Automatic continue by the ${PLUGIN_NAME} plugin cancelled.`, entry.note.partID)
     }
 
     async function fire(entry) {
@@ -486,7 +558,8 @@ export function createV1Server({
       if (now() < deadline && blockedUntil !== null && blockedUntil + config.bufferSeconds * 1000 > now() + 30_000) {
         const resumeAt = Math.min(blockedUntil + config.bufferSeconds * 1000, deadline)
         await save({ ...entry, resumeAt, resetAt: blockedUntil, source: "usage" })
-        if (entry.note) await writeNote(sessionID, entry.note.messageID, noteText(resumeAt, now()), entry.note.partID)
+        if (entry.note)
+          await writeNote(sessionID, entry.note.messageID, resumeNoteText({ resumeAt, source: "usage" }, now(), entry.model?.modelID), entry.note.partID)
         info(`${sessionID}: still limited; resuming at ${new Date(resumeAt).toLocaleString()}`)
         return
       }
@@ -503,7 +576,7 @@ export function createV1Server({
         })
         if (response?.error) throw new Error(JSON.stringify(response.error))
         await drop(sessionID)
-        if (entry.note) await writeNote(sessionID, entry.note.messageID, "ChatGPT usage limit reset. Continued automatically.", entry.note.partID)
+        if (entry.note) await writeNote(sessionID, entry.note.messageID, `ChatGPT usage limit reset. Continued automatically by the ${PLUGIN_NAME} plugin.`, entry.note.partID)
         info(`${sessionID}: usage limit reset; session resumed`)
       } catch (error) {
         resuming.delete(sessionID)

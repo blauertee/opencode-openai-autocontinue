@@ -1,5 +1,5 @@
 // OpenCode 1 server plugin (checked against OpenCode 1.19.5). Same goal as the
-// OpenCode 2 plugin in server.js, but 1.x has no retry hook, no plugin storage
+// OpenCode 2 plugin in server.ts, but 1.x has no retry hook, no plugin storage
 // and no credential API, so it works differently:
 //
 //   - Hold in place. When a request of an OpenAI session fails and OpenCode
@@ -26,12 +26,17 @@ import {
   limitsFromHeaders,
   normalizeConfig,
   planResume,
+  errorText,
   resetFromLimits,
+  type LimitError,
+  type Plan,
   retryMayBeLimit,
   usageCleared,
-} from "./logic.js"
-import { createLog } from "./log.js"
-import { createUsageReader } from "./usage.js"
+} from "./logic.ts"
+import type { Hooks, PluginInput } from "@opencode-ai/plugin"
+import type { AssistantMessage, Event, Message, Part, SessionStatus } from "@opencode-ai/sdk"
+import { createLog, type Logger } from "./log.ts"
+import { createUsageReader, type Bearer, type Fetch } from "./usage.ts"
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
@@ -39,19 +44,80 @@ import path from "node:path"
 const TICK_MS = 15_000
 const SEND_RETRY_MS = 60_000
 const MAX_SEND_FAILURES = 5
+type Env = Record<string, string | undefined>
+type Client = PluginInput["client"]
+type V1Error = NonNullable<AssistantMessage["error"]>
+
+/**
+ * The generated client's raw transport. The plugin client does not wrap the
+ * part endpoints, so the note is written through it.
+ */
+interface RawClient {
+  patch(options: { url: string; path: Record<string, string>; body: unknown; headers?: Record<string, string> }): Promise<{ error?: unknown }>
+  delete(options: { url: string; path: Record<string, string> }): Promise<{ error?: unknown }>
+}
+
+/** Where a note was written: a text part of an assistant message. */
+export interface Note {
+  messageID: string
+  partID: string
+}
+
+/** What the plugin remembers about a session's latest assistant message. */
+interface Known {
+  id: string
+  providerID: string
+  modelID: string
+  agent: string | undefined
+  completed: boolean
+  error: V1Error | null
+}
+
+/** A hold or pending resume, mirrored in the state file. */
+export interface Entry extends Plan {
+  sessionID: string
+  directory: string | undefined
+  mode: "hold" | "resume"
+  note: Note | null
+  streak: number
+  failures: number
+  deadline?: number
+  model: { providerID: string; modelID: string } | null
+  agent: string | null
+  createdAt: number
+}
+
+interface State {
+  entries: Record<string, Entry>
+}
+
+interface Hold {
+  cancelled: false | "interrupted" | "stopped" | "session deleted" | "shutdown"
+  wake: (() => void) | null
+  note: Note | null
+  plan: Plan
+}
+
+export interface Files {
+  readFile(file: string, encoding: "utf8"): Promise<string>
+  writeFile(file: string, text: string): Promise<void>
+  rename(from: string, to: string): Promise<void>
+  mkdir(dir: string, options: { recursive: true }): Promise<unknown>
+}
+
 const PART_URL = "/session/{sessionID}/message/{messageID}/part/{partID}"
 
 /* -- Files ------------------------------------------------------------------ */
 
-const dataDir = (env, home) => path.join(env.XDG_DATA_HOME || path.join(home, ".local", "share"), "opencode")
-const stateDir = (env, home) => path.join(env.XDG_STATE_HOME || path.join(home, ".local", "state"), "opencode")
+const dataDir = (env: Env, home: string) => path.join(env.XDG_DATA_HOME || path.join(home, ".local", "share"), "opencode")
+const stateDir = (env: Env, home: string) => path.join(env.XDG_STATE_HOME || path.join(home, ".local", "state"), "opencode")
 
 /** OpenCode 1 keeps provider credentials in `$XDG_DATA_HOME/opencode/auth.json`. */
-export function authFile(env = process.env, home = os.homedir()) {
+export function authFile(env: Env = process.env, home = os.homedir()): string {
   return path.join(dataDir(env, home), "auth.json")
 }
 
-export function stateFile(env = process.env, home = os.homedir()) {
+export function stateFile(env: Env = process.env, home = os.homedir()): string {
   return path.join(stateDir(env, home), "openai-autocontinue-v1.json")
 }
 
@@ -61,8 +127,10 @@ export function stateFile(env = process.env, home = os.homedir()) {
  * is not used: OpenCode refreshes it on its next request, and refreshing it
  * here would rotate the refresh token behind OpenCode's back.
  */
-export function bearerFromAuth(entry, nowMs = Date.now()) {
-  if (!entry || entry.type !== "oauth" || typeof entry.access !== "string" || !entry.access) return null
+export function bearerFromAuth(value: unknown, nowMs = Date.now()): Bearer | null {
+  if (!value || typeof value !== "object") return null
+  const entry = value as { type?: unknown; access?: unknown; expires?: unknown; accountId?: unknown; accountID?: unknown }
+  if (entry.type !== "oauth" || typeof entry.access !== "string" || !entry.access) return null
   if (typeof entry.expires === "number" && entry.expires > 0 && entry.expires < nowMs + 30_000) return null
   const accountID = entry.accountId ?? entry.accountID
   return { access: entry.access, accountID: typeof accountID === "string" && accountID ? accountID : null }
@@ -95,9 +163,10 @@ export function partID(nowMs = Date.now()) {
  * An OpenCode 1 session error (`{ name: "APIError", data: { ... } }`) in the
  * shape the shared logic reads (`{ message, status, response: { body } }`).
  */
-export function fromV1Error(error) {
+export function fromV1Error(error: V1Error | null | undefined): LimitError | null {
   if (!error || typeof error !== "object") return null
-  const data = error.data && typeof error.data === "object" ? error.data : {}
+  const data: { message?: string; statusCode?: number; responseHeaders?: Record<string, string>; responseBody?: string } =
+    error.data && typeof error.data === "object" ? error.data : {}
   const headers = data.responseHeaders ?? {}
   const retryAfter = Number.parseFloat(headers["retry-after"] ?? "")
   return {
@@ -109,11 +178,12 @@ export function fromV1Error(error) {
   }
 }
 
-const result = (response) => (response && typeof response === "object" && "data" in response ? response.data : response)
+/** The `data` of a generated-client response (which never throws). */
+const result = <T>(response: { data?: T } | undefined): T | undefined => response?.data
 
 export const PLUGIN_NAME = "opencode-openai-autocontinue"
 
-function at(resumeAt, nowMs) {
+function at(resumeAt: number, nowMs: number): string {
   const when = new Date(resumeAt)
   const sameDay = new Date(nowMs).toDateString() === when.toDateString()
   const time = sameDay
@@ -124,7 +194,7 @@ function at(resumeAt, nowMs) {
 }
 
 /** Why the plugin believes the limit is reached, by where the reset time came from. */
-function reason(source, modelID) {
+function reason(source: Plan["source"], modelID: string | null | undefined): string {
   const model = modelID ? ` for ${modelID}` : ""
   switch (source) {
     case "usage":
@@ -145,7 +215,7 @@ function reason(source, modelID) {
  * says that nothing has been sent and how to cancel, so a held session is
  * never mistaken for a slow model or a stuck provider.
  */
-export function holdNoteText(plan, nowMs, modelID) {
+export function holdNoteText(plan: Pick<Plan, "resumeAt" | "source">, nowMs: number, modelID?: string | null): string {
   return (
     `⏸ Held by the ${PLUGIN_NAME} plugin: this request has not been sent. ` +
     `Reason: ${reason(plan.source, modelID)}. ` +
@@ -155,7 +225,7 @@ export function holdNoteText(plan, nowMs, modelID) {
 }
 
 /** The note left under a session that stopped and will be continued later. */
-export function resumeNoteText(plan, nowMs, modelID) {
+export function resumeNoteText(plan: Pick<Plan, "resumeAt" | "source">, nowMs: number, modelID?: string | null): string {
   return (
     `⏸ Stopped by the ChatGPT usage limit (${reason(plan.source, modelID)}). ` +
     `The ${PLUGIN_NAME} plugin will continue this session at ${at(plan.resumeAt, nowMs)}. ` +
@@ -178,21 +248,34 @@ export function createV1Server({
   env = process.env,
   home = os.homedir(),
   files = { readFile, writeFile, rename, mkdir },
-} = {}) {
+}: {
+  fetch?: Fetch
+  now?: () => number
+  setTimeout?: (fn: () => void, ms: number) => unknown
+  clearTimeout?: (timer: any) => void
+  setInterval?: (fn: () => void, ms: number) => unknown
+  clearInterval?: (timer: any) => void
+  logger?: Logger
+  env?: Env
+  home?: string
+  files?: Files
+} = {}): (input: Pick<PluginInput, "client" | "directory">, options?: Record<string, unknown>) => Promise<Hooks> {
   return async function server(input, options) {
     const config = normalizeConfig(options ?? {})
     const { info, debug } = createLog(config, logger)
     if (!config.enabled) return {}
 
     const client = input.client
-    const raw = client?._client ?? client?.session?._client
+    const internals = client as unknown as { _client?: RawClient; session?: { _client?: RawClient } } | undefined
+    const raw = internals?._client ?? internals?.session?._client
     const directory = input.directory
     const statePath = stateFile(env, home)
 
-    async function credential() {
+    async function credential(): Promise<Bearer | null> {
       try {
         const text = env.OPENCODE_AUTH_CONTENT || (await files.readFile(authFile(env, home), "utf8"))
-        return bearerFromAuth(JSON.parse(text)?.[config.usageIntegrationID], now())
+        const auth: Record<string, unknown> | null = JSON.parse(text)
+        return bearerFromAuth(auth?.[config.usageIntegrationID], now())
       } catch {
         return null
       }
@@ -200,26 +283,26 @@ export function createV1Server({
     const readUsage = createUsageReader({ config, fetch: fetcher, now, log: debug, credential })
 
     /** sessionID -> latest assistant message `{ id, providerID, modelID, agent, completed }`. */
-    const assistants = new Map()
+    const assistants = new Map<string, Known>()
     /** sessionID -> `{ resumeAt, resetAt, source }` once a retry was found to be a usage limit. */
-    const limited = new Map()
+    const limited = new Map<string, Plan>()
     /** sessionID -> promise of the usage check started by a retry. */
-    const checking = new Map()
+    const checking = new Map<string, Promise<void>>()
     /** sessionID -> the hold currently keeping a request back. */
-    const holds = new Map()
+    const holds = new Map<string, Hold>()
     /** sessionID -> durable entry (mirrored in the state file). */
-    const pending = new Map()
-    const streak = new Map()
-    const resuming = new Set()
-    const firing = new Set()
-    const parents = new Map()
+    const pending = new Map<string, Entry>()
+    const streak = new Map<string, number>()
+    const resuming = new Set<string>()
+    const firing = new Set<string>()
+    const parents = new Map<string, string | null>()
 
-    const allowedProvider = (providerID) => typeof providerID === "string" && config.providerIDs.includes(providerID)
+    const allowedProvider = (providerID: unknown): providerID is string => typeof providerID === "string" && config.providerIDs.includes(providerID)
 
     /* -- State file ----------------------------------------------------- */
 
-    let writing = Promise.resolve()
-    async function readState() {
+    let writing: Promise<void> = Promise.resolve()
+    async function readState(): Promise<State> {
       try {
         const value = JSON.parse(await files.readFile(statePath, "utf8"))
         return value && typeof value === "object" && value.entries && typeof value.entries === "object" ? value : { entries: {} }
@@ -227,7 +310,7 @@ export function createV1Server({
         return { entries: {} }
       }
     }
-    function persist(sessionID, entry) {
+    function persist(sessionID: string, entry: Entry | null) {
       // Read-modify-write, serialised: other projects' instances share the file.
       writing = writing
         .then(async () => {
@@ -239,14 +322,14 @@ export function createV1Server({
           await files.writeFile(temp, JSON.stringify(state, null, 2))
           await files.rename(temp, statePath)
         })
-        .catch((error) => debug(`could not write ${statePath}: ${error?.message ?? error}`))
+        .catch((error) => debug(`could not write ${statePath}: ${errorText(error)}`))
       return writing
     }
-    async function save(entry) {
+    async function save(entry: Entry) {
       pending.set(entry.sessionID, entry)
       await persist(entry.sessionID, entry)
     }
-    async function drop(sessionID, reason) {
+    async function drop(sessionID: string, reason?: string): Promise<Entry | undefined> {
       const entry = pending.get(sessionID)
       if (!entry) return
       pending.delete(sessionID)
@@ -257,7 +340,7 @@ export function createV1Server({
 
     /* -- Session helpers ---------------------------------------------- */
 
-    async function eligible(sessionID) {
+    async function eligible(sessionID: string): Promise<boolean> {
       if (config.resumeSubagents) return true
       if (!parents.has(sessionID)) {
         try {
@@ -271,19 +354,19 @@ export function createV1Server({
       return !parents.get(sessionID)
     }
 
-    async function lastAssistant(sessionID) {
+    async function lastAssistant(sessionID: string): Promise<Known | null> {
       const known = assistants.get(sessionID)
       if (known) return known
       try {
         const messages = result(await client.session.messages({ path: { id: sessionID } })) ?? []
         const found = [...messages].reverse().find((item) => item?.info?.role === "assistant")?.info
-        return found ? remember(found) : null
+        return found?.role === "assistant" ? remember(found) : null
       } catch {
         return null
       }
     }
 
-    function remember(message) {
+    function remember(message: AssistantMessage & { agent?: string }): Known {
       const value = {
         id: message.id,
         providerID: message.providerID,
@@ -298,7 +381,7 @@ export function createV1Server({
 
     /* -- Chat note -------------------------------------------------------- */
 
-    async function writeNote(sessionID, messageID, text, id = partID(now())) {
+    async function writeNote(sessionID: string, messageID: string | null | undefined, text: string, id = partID(now())): Promise<Note | null> {
       if (!raw || !messageID) return null
       try {
         const response = await raw.patch({
@@ -310,21 +393,21 @@ export function createV1Server({
         if (response?.error) throw new Error(JSON.stringify(response.error))
         return { messageID, partID: id }
       } catch (error) {
-        debug(`${sessionID}: could not write the note: ${error?.message ?? error}`)
+        debug(`${sessionID}: could not write the note: ${errorText(error)}`)
         return null
       }
     }
 
-    async function deleteNote(sessionID, note) {
+    async function deleteNote(sessionID: string, note: Note | null | undefined) {
       if (!raw || !note) return
       try {
         await raw.delete({ url: PART_URL, path: { sessionID, messageID: note.messageID, partID: note.partID } })
       } catch (error) {
-        debug(`${sessionID}: could not delete the note: ${error?.message ?? error}`)
+        debug(`${sessionID}: could not delete the note: ${errorText(error)}`)
       }
     }
 
-    async function toast(message, variant = "warning") {
+    async function toast(message: string, variant: "info" | "success" | "warning" | "error" = "warning") {
       try {
         await client.tui?.showToast?.({ body: { title: PLUGIN_NAME, message, variant, duration: 30_000 } })
       } catch {}
@@ -335,7 +418,7 @@ export function createV1Server({
      * session's latest assistant message (the note is deleted before the
      * request goes out, so the model never sees it either way).
      */
-    async function noteTarget(sessionID, assistant) {
+    async function noteTarget(sessionID: string, assistant: Known | null): Promise<string | null> {
       if (assistant && !assistant.completed) return assistant.id
       try {
         const messages = result(await client.session.messages({ path: { id: sessionID } })) ?? []
@@ -343,14 +426,14 @@ export function createV1Server({
         const target = replies.findLast((info) => !info.time?.completed) ?? replies.at(-1)
         if (target?.id) return target.id
       } catch (error) {
-        debug(`${sessionID}: could not list messages for the note: ${error?.message ?? error}`)
+        debug(`${sessionID}: could not list messages for the note: ${errorText(error)}`)
       }
       return assistant?.id ?? null
     }
 
     /* -- Detecting a usage limit during OpenCode's retry ------------------ */
 
-    async function check(sessionID, status) {
+    async function check(sessionID: string, status: Extract<SessionStatus, { type: "retry" }>) {
       // Only a retry that can be the plan limit is checked: a header timeout,
       // network error or overloaded server is OpenCode's to retry, even while
       // some allowance on the account happens to be used up.
@@ -377,8 +460,8 @@ export function createV1Server({
 
     /* -- Holding a request until the reset -------------------------------- */
 
-    function sleep(ms, hold) {
-      return new Promise((resolve) => {
+    function sleep(ms: number, hold: Hold) {
+      return new Promise<void>((resolve) => {
         const timer = later(resolve, ms)
         hold.wake = () => {
           cancelLater(timer)
@@ -387,7 +470,7 @@ export function createV1Server({
       })
     }
 
-    async function hold(sessionID, plan) {
+    async function hold(sessionID: string, plan: Plan) {
       const count = (streak.get(sessionID) ?? 0) + 1
       if (config.maxConsecutiveResumes > 0 && count > config.maxConsecutiveResumes) {
         streak.delete(sessionID)
@@ -397,14 +480,14 @@ export function createV1Server({
       }
       streak.set(sessionID, count)
 
-      const state = { cancelled: false, wake: null, note: null, plan }
+      const state: Hold = { cancelled: false, wake: null, note: null, plan }
       holds.set(sessionID, state)
       const assistant = await lastAssistant(sessionID)
       const modelID = assistant?.modelID
       // Fixed when the hold starts: re-checks may move the resume time, but
       // never past this, however often the limit turns out to last longer.
       const deadline = now() + config.maxWaitHours * 3_600_000
-      const entry = (extra = {}) => ({
+      const entry = (extra: Partial<Entry> = {}): Entry => ({
         sessionID,
         directory,
         mode: "hold",
@@ -483,7 +566,7 @@ export function createV1Server({
       else info(`${sessionID}: usage limit reset; sending the request again`)
     }
 
-    function cancelHold(sessionID, reason) {
+    function cancelHold(sessionID: string, reason: Exclude<Hold["cancelled"], false>) {
       const state = holds.get(sessionID)
       if (!state) return false
       state.cancelled = reason
@@ -493,7 +576,7 @@ export function createV1Server({
 
     /* -- Fallback: resume after the session stopped ------------------------ */
 
-    async function onFailed(sessionID, rawError) {
+    async function onFailed(sessionID: string, rawError: V1Error | undefined) {
       const error = fromV1Error(rawError)
       limited.delete(sessionID)
       if (!isUsageLimitError(error)) return drop(sessionID)
@@ -513,7 +596,7 @@ export function createV1Server({
       const plan = planResume({
         error,
         usage,
-        headers: limitsFromHeaders(error.response.headers, now()),
+        headers: limitsFromHeaders(error.response?.headers, now()),
         nowMs: now(),
         config,
         modelID: assistant.modelID,
@@ -538,14 +621,14 @@ export function createV1Server({
       info(`${sessionID}: ChatGPT usage limit reached; resuming at ${new Date(plan.resumeAt).toLocaleString()} (reset time from ${plan.source})`)
     }
 
-    async function cancelResume(sessionID, reason) {
+    async function cancelResume(sessionID: string, reason: string) {
       const entry = await drop(sessionID, reason)
       if (entry?.mode === "resume" && entry.note) await writeNote(sessionID, entry.note.messageID, `Automatic continue by the ${PLUGIN_NAME} plugin cancelled.`, entry.note.partID)
     }
 
-    async function fire(entry) {
+    async function fire(entry: Entry) {
       const sessionID = entry.sessionID
-      let statuses = {}
+      let statuses: Record<string, SessionStatus> = {}
       try {
         statuses = result(await client.session.status()) ?? {}
       } catch {}
@@ -581,9 +664,9 @@ export function createV1Server({
       } catch (error) {
         resuming.delete(sessionID)
         const failures = (entry.failures ?? 0) + 1
-        if (failures >= MAX_SEND_FAILURES) return cancelResume(sessionID, `could not resume: ${error?.message ?? error}`)
+        if (failures >= MAX_SEND_FAILURES) return cancelResume(sessionID, `could not resume: ${errorText(error)}`)
         await save({ ...entry, failures, resumeAt: now() + SEND_RETRY_MS })
-        debug(`${sessionID}: resume failed (${error?.message ?? error}); trying again in a minute`)
+        debug(`${sessionID}: resume failed (${errorText(error)}); trying again in a minute`)
       }
     }
 
@@ -591,7 +674,7 @@ export function createV1Server({
     const lastCheck = new Map()
     const checkingEarly = new Set()
 
-    async function checkEarly(entry) {
+    async function checkEarly(entry: Entry) {
       const sessionID = entry.sessionID
       lastCheck.set(sessionID, now())
       if (!usageCleared(await readUsage(), now(), entry.model?.modelID)) return
@@ -612,7 +695,7 @@ export function createV1Server({
           if (now() - (lastCheck.get(sessionID) ?? entry.createdAt ?? 0) < interval) continue
           checkingEarly.add(sessionID)
           await checkEarly(entry)
-            .catch((error) => debug(`${sessionID}: ${error?.message ?? error}`))
+            .catch((error) => debug(`${sessionID}: ${errorText(error)}`))
             .finally(() => checkingEarly.delete(sessionID))
         }
       }
@@ -621,30 +704,29 @@ export function createV1Server({
         if (entry.mode !== "resume" || entry.resumeAt > at || firing.has(entry.sessionID)) continue
         firing.add(entry.sessionID)
         void fire(entry)
-          .catch((error) => debug(`${entry.sessionID}: ${error?.message ?? error}`))
+          .catch((error) => debug(`${entry.sessionID}: ${errorText(error)}`))
           .finally(() => firing.delete(entry.sessionID))
       }
     }
 
     /* -- Events ----------------------------------------------------------- */
 
-    async function onEvent(event) {
-      const props = event?.properties ?? {}
+    async function onEvent(event: Event) {
       switch (event?.type) {
         case "message.updated": {
-          const message = props.info
+          const message = event.properties.info
           if (message?.role !== "assistant" || !message.sessionID) return
           const value = remember(message)
           if (value.completed && !value.error && !holds.has(message.sessionID) && !limited.has(message.sessionID)) streak.delete(message.sessionID)
           return
         }
         case "session.status": {
-          const sessionID = props.sessionID
-          const type = props.status?.type
+          const { sessionID, status } = event.properties
+          const type = status?.type
           if (!sessionID) return
-          if (type === "retry") {
+          if (status?.type === "retry") {
             if (holds.has(sessionID)) return
-            const run = check(sessionID, props.status).catch((error) => debug(`${sessionID}: ${error?.message ?? error}`))
+            const run = check(sessionID, status).catch((error) => debug(`${sessionID}: ${errorText(error)}`))
             checking.set(sessionID, run)
             await run
             if (checking.get(sessionID) === run) checking.delete(sessionID)
@@ -665,9 +747,9 @@ export function createV1Server({
           return
         }
         case "session.error": {
-          const sessionID = props.sessionID
+          const { sessionID, error } = event.properties
           if (!sessionID) return
-          if (props.error?.name === "MessageAbortedError") {
+          if (error?.name === "MessageAbortedError") {
             streak.delete(sessionID)
             limited.delete(sessionID)
             if (cancelHold(sessionID, "interrupted")) return
@@ -675,10 +757,10 @@ export function createV1Server({
             return
           }
           if (holds.has(sessionID)) return
-          return onFailed(sessionID, props.error)
+          return onFailed(sessionID, error)
         }
         case "session.deleted": {
-          const sessionID = props.info?.id
+          const sessionID = event.properties.info?.id
           if (!sessionID) return
           cancelHold(sessionID, "session deleted")
           for (const map of [assistants, limited, streak, parents, lastCheck]) map.delete(sessionID)
@@ -690,7 +772,7 @@ export function createV1Server({
     /* -- Restore and run -------------------------------------------------- */
 
     const state = await readState()
-    const stale = []
+    const stale: [string, Note][] = []
     for (const [sessionID, value] of Object.entries(state.entries)) {
       if (!value || typeof value !== "object" || value.sessionID !== sessionID) continue
       if (directory && value.directory && value.directory !== directory) continue
@@ -711,16 +793,16 @@ export function createV1Server({
         const entry = pending.get(sessionID)
         if (entry) await save(entry)
       }
-    })().catch((error) => debug(`restore: ${error?.message ?? error}`))
+    })().catch((error) => debug(`restore: ${errorText(error)}`))
 
     let restoring = true
     void restored.finally(() => (restoring = false))
     const timer = every(() => void tick(), TICK_MS)
-    timer?.unref?.()
+    ;(timer as { unref?: () => void } | undefined)?.unref?.()
 
     return {
       event: async ({ event }) => {
-        await onEvent(event).catch((error) => debug(`event ${event?.type}: ${error?.message ?? error}`))
+        await onEvent(event).catch((error) => debug(`event ${event?.type}: ${errorText(error)}`))
       },
       "chat.headers": async (hookInput) => {
         const sessionID = hookInput?.sessionID

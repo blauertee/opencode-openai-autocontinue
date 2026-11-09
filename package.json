@@ -17,23 +17,22 @@
     "rate-limit"
   ],
   "exports": {
-    ".": "./src/server.js",
-    "./server": "./src/server.js"
+    ".": "./src/server.ts",
+    "./server": "./src/server.ts"
   },
   "files": [
     "src",
     "LICENSE",
     "README.md"
   ],
-  "engines": {
-    "node": ">=20"
-  },
   "scripts": {
-    "test": "node --test 'test/**/*.test.js'"
+    "test": "node --test 'test/**/*.test.ts'",
+    "typecheck": "tsc -p . && tsc -p tsconfig.test.json",
+    "check": "npm run typecheck && npm test"
   },
   "peerDependencies": {
-    "@opencode/plugin": "^2.0.0",
-    "@opencode-ai/plugin": ">=1.19.0 <2"
+    "@opencode-ai/plugin": ">=1.19.0 <2",
+    "@opencode/plugin": "^2.0.0"
   },
   "peerDependenciesMeta": {
     "@opencode/plugin": {
@@ -42,5 +41,12 @@
     "@opencode-ai/plugin": {
       "optional": true
     }
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "1.19.5",
+    "@opencode-ai/sdk": "1.19.5",
+    "@opencode/plugin": "2.2.5",
+    "@types/node": "^22.20.5",
+    "typescript": "^7.0.2"
   }
 }

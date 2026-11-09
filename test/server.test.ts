@@ -1,14 +1,20 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
-import { createAutoContinuePlugin } from "../src/server.js"
-import { createFakeContext, settle } from "./fake-context.js"
+import { createAutoContinuePlugin } from "../src/server.ts"
+import { createFakeContext, settle } from "./fake-context.ts"
 
 const START = 1_800_000_000_000
 const S = (ms) => Math.floor(ms / 1000)
 const model = { providerID: "openai", id: "gpt-6-sol" }
 const session = (extra = {}) => ({ id: "ses_1", model, time: { created: START, updated: START, busy: START, idle: START + 1 }, ...extra })
 
-function harness({ options, sessions = { ses_1: session() }, credential, usage, storage } = {}) {
+function harness({
+  options,
+  sessions = { ses_1: session() },
+  credential,
+  usage,
+  storage,
+}: { options?: Record<string, unknown>; sessions?: Record<string, unknown>; credential?: unknown; usage?: unknown; storage?: Map<string, any> } = {}) {
   let clock = START
   let tick
   const logs = []
@@ -65,7 +71,7 @@ test("short wait: retries in place with the delay to the reset plus buffer", asy
   assert.equal(h.storage.get("pending:ses_1").mode, "inline")
   await h.emit("session.execution.succeeded", { sessionID: "ses_1" })
   assert.equal(h.storage.has("pending:ses_1"), false)
-  await cleanup()
+  if (cleanup) await cleanup()
 })
 
 test("ignores other providers and other errors", async () => {
@@ -107,7 +113,7 @@ test("long wait: stops retries, resumes the session after the reset from the usa
   await h.advance(4 * 3600_000)
   assert.equal(h.calls.synthetic.length, 0)
 
-  usage = { rate_limit: { allowed: true, primary_window: { used_percent: 0, reset_at: resetAt + 18000 } } }
+  usage = { rate_limit: { allowed: true, limit_reached: false, primary_window: { used_percent: 0, reset_at: resetAt + 18000 } } }
   await h.advance(3600_000 + 61_000)
   assert.equal(h.calls.synthetic.length, 1)
   assert.equal(h.calls.synthetic[0].sessionID, "ses_1")

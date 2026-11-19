@@ -29,7 +29,9 @@ import {
   errorText,
   resetFromLimits,
   type LimitError,
+  type Limits,
   type Plan,
+  reachedOnly,
   retryMayBeLimit,
   usageCleared,
 } from "./logic.ts"
@@ -445,17 +447,34 @@ export function createV1Server({
       if (!allowedProvider(assistant?.providerID)) return
       if (!(await eligible(sessionID))) return
       const usage = await readUsage()
-      const blockedUntil = resetFromLimits(usage, now(), assistant.modelID)
-      const looksLikeLimit = /usage[ _-]?limit/i.test(status?.message ?? "")
-      if (blockedUntil === null && !(usage === null && looksLikeLimit)) {
+      const blockedUntil = holdUntil(usage, status, assistant.modelID)
+      if (blockedUntil === null) {
         limited.delete(sessionID)
+        debug(`${sessionID}: retry "${status?.message}" left to OpenCode (usage ${usage ? "does not report this model as blocked" : "unreadable"})`)
         return
       }
-      // Usage unreadable but the message says it is the plan limit: wait the
-      // fallback and let the retry find out.
       const plan = planResume({ error: null, usage, headers: null, nowMs: now(), config, modelID: assistant.modelID })
       limited.set(sessionID, plan)
       debug(`${sessionID}: retry is a usage limit; holding until ${new Date(plan.resumeAt).toISOString()} (${plan.source})`)
+    }
+
+    /**
+     * When a retry has to be held back, or null when OpenCode's own retry is
+     * left alone. A hold needs the usage endpoint to report this model as
+     * blocked: a guess without it (the old 15 minute fallback) held requests
+     * that OpenCode's next attempt would have sent fine. A generic rate-limit
+     * or 429 message also needs the endpoint to flag the limit as reached,
+     * not just a window at 100%. And a reset that comes before OpenCode's
+     * next attempt anyway needs no hold.
+     */
+    function holdUntil(usage: Limits | null, status: Extract<SessionStatus, { type: "retry" }>, modelID: string): number | null {
+      if (!usage) return null
+      const nowMs = now()
+      const planLimit = /usage[ _-]?limit/i.test(status?.message ?? "")
+      const blockedUntil = resetFromLimits(planLimit ? usage : reachedOnly(usage), nowMs, modelID)
+      if (blockedUntil === null) return null
+      const next = typeof status?.next === "number" && Number.isFinite(status.next) ? status.next : nowMs
+      return blockedUntil > next ? blockedUntil : null
     }
 
     /* -- Holding a request until the reset -------------------------------- */

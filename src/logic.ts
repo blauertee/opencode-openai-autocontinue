@@ -306,6 +306,14 @@ export function resetFromLimits(limits: Limits | null | undefined, nowMs = Date.
 }
 
 /**
+ * Only the limits the usage endpoint explicitly flags as reached
+ * (`limit_reached` or `allowed: false`), for evidence that has to be firm.
+ */
+export function reachedOnly(limits: Limits): Limits {
+  return { main: limits.main?.reached ? limits.main : null, additional: (limits.additional ?? []).filter((limit) => limit.reached) }
+}
+
+/**
  * Whether usage data was read and shows nothing blocking `modelID`, for
  * example after the user redeemed a usage reset. Unreadable usage (null) is
  * not "cleared".

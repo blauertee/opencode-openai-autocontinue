@@ -268,6 +268,42 @@ test("a header timeout retry is never turned into a hold", async () => {
   assert.equal(h.calls.patch.length, 0)
 })
 
+test("unreadable usage never holds a retry, even one that says usage limit", async () => {
+  const h = await harness({ usage: () => null })
+  await h.emit("message.updated", { info: assistant() })
+  await h.emit("session.status", { sessionID: "ses_1", status: { type: "retry", attempt: 1, message: "You have hit your usage limit", next: START + 2000 } })
+  let released = false
+  await h.hooks["chat.headers"](headersInput, { headers: {} }).then(() => (released = true))
+  assert.equal(released, true)
+  assert.equal(h.calls.patch.length, 0)
+  assert.equal(h.state().ses_1, undefined)
+})
+
+test("a generic rate-limit retry needs the usage endpoint to flag the limit as reached", async () => {
+  // A window at 100% that the endpoint does not report as reached.
+  const usage = { rate_limit: { allowed: true, limit_reached: false, primary_window: { used_percent: 100, reset_at: S(START) + 3600 } } }
+  const h = await harness({ usage: () => usage })
+  await h.emit("message.updated", { info: assistant() })
+  await h.emit("session.status", { sessionID: "ses_1", status: { type: "retry", attempt: 1, message: "Too Many Requests", next: START + 2000 } })
+  await h.hooks["chat.headers"](headersInput, { headers: {} })
+  assert.equal(h.calls.patch.length, 0)
+
+  const flagged = await harness({ usage: () => blockedUsage(START + 3600_000) })
+  await flagged.emit("message.updated", { info: assistant() })
+  await flagged.emit("session.status", { sessionID: "ses_1", status: { type: "retry", attempt: 1, message: "Too Many Requests", next: START + 2000 } })
+  void flagged.hooks["chat.headers"](headersInput, { headers: {} })
+  await settle()
+  assert.equal(flagged.calls.patch.length, 1)
+})
+
+test("a reset before OpenCode's own next attempt needs no hold", async () => {
+  const h = await harness({ usage: () => blockedUsage(START + 20_000) })
+  await h.emit("message.updated", { info: assistant() })
+  await h.emit("session.status", { sessionID: "ses_1", status: { type: "retry", attempt: 3, message: "The usage limit has been reached", next: START + 30_000 } })
+  await h.hooks["chat.headers"](headersInput, { headers: {} })
+  assert.equal(h.calls.patch.length, 0)
+})
+
 test("another model's exhausted allowance does not hold this model", async () => {
   const usage = {
     rate_limit: { allowed: true, limit_reached: false, primary_window: { used_percent: 10, reset_at: S(START) + 18_000 } },

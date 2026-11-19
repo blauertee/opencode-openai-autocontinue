@@ -60,8 +60,12 @@ no retry hook and no plugin storage, so it works a little differently there:
 1. **The session keeps working.** When a request fails with what can be a
    usage or rate limit and OpenCode schedules a retry, the plugin checks the
    usage endpoint. Other retries (header timeouts, network errors, overloaded
-   servers) are left to OpenCode. If the plan's limit is exhausted, it holds
-   the next attempt back until the reset (plus the buffer). A model-specific
+   servers) are left to OpenCode. It holds the next attempt back until the
+   reset (plus the buffer) only when the usage endpoint reports the plan's
+   limit as exhausted for that model (for a generic rate-limit or 429 retry,
+   only when the endpoint flags the limit as reached) and the reset comes
+   after OpenCode's own next attempt. If the usage cannot be read, nothing is
+   held and OpenCode keeps retrying on its own schedule. A model-specific
    allowance only counts for the model it names, so a used-up allowance of
    another model never holds this one. The spinner keeps running, the original request is then sent
    again, and no "continue" message is needed.
